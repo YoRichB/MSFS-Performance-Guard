@@ -1,0 +1,19 @@
+# Local runtime
+Logs/
+state.json
+*.log
+
+# Built launcher (rebuild with csc from MSFSGuardHost.cs)
+MSFSGuard.exe
+
+# Icons are generated on first run
+Icons/*.ico
+Icons/*.png
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.vscode/
+.idea/
