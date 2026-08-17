@@ -2,7 +2,8 @@
 # User-level keepalive: start at logon and re-check every 2 minutes.
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$watch = Join-Path $here 'Watchdog-MSFSGuard.bat'
+$watchVbs = Join-Path $here 'Watchdog-MSFSGuard.vbs'
+$wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $exe = Join-Path $here 'MSFSGuard.exe'
 
 $settings = New-ScheduledTaskSettingsSet `
@@ -26,6 +27,7 @@ Register-ScheduledTask -TaskName 'MSFS-Guard-Logon' -Action $actionLogon -Trigge
     -Principal $principal -Settings $settings `
     -Description 'Start MSFS Performance Guard when you sign in.' -Force | Out-Null
 
-schtasks.exe /Create /TN 'MSFS-Guard-Watchdog' /TR "`"$watch`"" /SC MINUTE /MO 2 /F | Out-Null
+$tr = "`"$wscript`" //B //Nologo `"$watchVbs`""
+schtasks.exe /Create /TN 'MSFS-Guard-Watchdog' /TR $tr /SC MINUTE /MO 2 /F | Out-Null
 
 Write-Host 'Keepalive tasks registered: MSFS-Guard-Logon and MSFS-Guard-Watchdog' -ForegroundColor Green

@@ -52,7 +52,16 @@ internal static class Program
             HostLog.Write(dir, "Host starting pid=" + Process.GetCurrentProcess().Id);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new HostContext(dir));
+            bool silent = false;
+            foreach (string a in Environment.GetCommandLineArgs())
+            {
+                if (string.Equals(a, "--silent", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(a, "/silent", StringComparison.OrdinalIgnoreCase))
+                {
+                    silent = true;
+                }
+            }
+            Application.Run(new HostContext(dir, silent));
             HostLog.Write(dir, "Host Application.Run returned");
         }
     }
@@ -85,10 +94,13 @@ internal sealed class HostContext : ApplicationContext
     private readonly System.Windows.Forms.Timer hideSplash;
     private Icon icon;
     private EventWaitHandle sessionDone;
+    private DateTime lastEngineStart = DateTime.MinValue;
+    private readonly bool silent;
 
-    public HostContext(string dir)
+    public HostContext(string dir, bool silent)
     {
         this.dir = dir;
+        this.silent = silent;
         ps1 = Path.Combine(dir, "MSFSGuard.ps1");
         powershell = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
 
@@ -134,15 +146,15 @@ internal sealed class HostContext : ApplicationContext
         RefreshStatus();
 
         hideSplash = new System.Windows.Forms.Timer();
-        hideSplash.Interval = 3500;
+        hideSplash.Interval = silent ? 50 : 3500;
         hideSplash.Tick += delegate
         {
             hideSplash.Stop();
             panel.WindowState = FormWindowState.Minimized;
-            HostLog.Write(dir, "Startup toast hidden; taskbar icon remains");
+            HostLog.Write(dir, silent ? "Silent start; taskbar icon only" : "Startup toast hidden; taskbar icon remains");
         };
         hideSplash.Start();
-        HostLog.Write(dir, "Host UI up (toast by taskbar)");
+        HostLog.Write(dir, silent ? "Host UI up (silent)" : "Host UI up (toast by taskbar)");
     }
 
     private Icon LoadIcon()
@@ -285,15 +297,18 @@ internal sealed class HostContext : ApplicationContext
         {
             return;
         }
-        HostLog.Write(dir, "Starting monitor engine (detached)");
-        string args = "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + ps1 + "\"";
-        // cmd start detaches from any job object so the monitor is not killed
-        // when a parent automation command exits.
+        if ((DateTime.UtcNow - lastEngineStart).TotalSeconds < 30)
+        {
+            return;
+        }
+        lastEngineStart = DateTime.UtcNow;
+        HostLog.Write(dir, "Starting monitor engine (no window)");
         ProcessStartInfo psi = new ProcessStartInfo();
-        psi.FileName = Path.Combine(Environment.SystemDirectory, "cmd.exe");
-        psi.Arguments = "/c start \"MSFSGuardEngine\" /min \"" + powershell + "\" " + args;
+        psi.FileName = powershell;
+        psi.Arguments = "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File \"" + ps1 + "\"";
         psi.WorkingDirectory = dir;
-        psi.UseShellExecute = true;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
         psi.WindowStyle = ProcessWindowStyle.Hidden;
         Process.Start(psi);
     }
