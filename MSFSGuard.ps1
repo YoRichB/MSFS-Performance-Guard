@@ -6,8 +6,10 @@
 .DESCRIPTION
     Lives in the system tray. While Flight Simulator is running it watches other
     programs for CPU, RAM, and disk pressure, then pops a suggestion overlay so
-    you can Sleep (freeze) or Close the hog. Slept programs are resumed when
-    MSFS exits, when you ask, or when this app quits.
+    you can Sleep (freeze) or Close the hog. It also samples FPS (PresentMon),
+    GPU, RAM, disk, and network the same way the sim Dev FPS overlay does, so
+    the flight report can say what actually limited frames. Slept programs are
+    resumed when MSFS exits, when you ask, or when this app quits.
 
     Never touches Windows protected processes, Defender, or your sim add-ons.
     Nothing is closed or frozen without a click (unless you turn on AutoSleep).
@@ -472,6 +474,515 @@ function Get-FreeRamMB {
     return $mb
 }
 
+function Initialize-HardwareCounters {
+    if ($script:HwReady) { return }
+    $script:HwReady = $false
+    try {
+        $script:PcCpu = New-Object System.Diagnostics.PerformanceCounter('Processor', '% Processor Time', '_Total')
+        $script:PcDiskQ = New-Object System.Diagnostics.PerformanceCounter('PhysicalDisk', 'Avg. Disk Queue Length', '_Total')
+        $script:PcDiskB = New-Object System.Diagnostics.PerformanceCounter('PhysicalDisk', 'Disk Bytes/sec', '_Total')
+        $script:PcNet = New-Object System.Collections.Generic.List[object]
+        $cat = New-Object System.Diagnostics.PerformanceCounterCategory('Network Interface')
+        foreach ($inst in $cat.GetInstanceNames()) {
+            if ($inst -match 'isatap|loopback|teredo|virtual|VPN|Bluetooth') { continue }
+            [void]$script:PcNet.Add((New-Object System.Diagnostics.PerformanceCounter('Network Interface', 'Bytes Total/sec', $inst)))
+        }
+        [void]$script:PcCpu.NextValue()
+        [void]$script:PcDiskQ.NextValue()
+        [void]$script:PcDiskB.NextValue()
+        foreach ($c in $script:PcNet) { [void]$c.NextValue() }
+        $script:HwReady = $true
+        Write-Log 'Hardware counters ready (CPU/GPU/disk/network)' 'OK'
+    } catch {
+        Write-Log ("Hardware counters failed: {0}" -f $_.Exception.Message) 'WARN'
+    }
+    $script:PresentMonExe = $null
+    foreach ($p in @(
+            "${env:ProgramFiles}\AMD\CNext\CNext\PresentMon-x64.exe",
+            "${env:ProgramFiles(x86)}\PresentMon\PresentMon-x64.exe",
+            "${env:ProgramFiles}\PresentMon\PresentMon-x64.exe"
+        )) {
+        if (Test-Path -LiteralPath $p) { $script:PresentMonExe = $p; break }
+    }
+    Ensure-FrameProbe
+}
+
+function Get-GpuSample {
+    param([int[]]$MsfsPids)
+    $gpu = 0.0
+    $msfsGpu = 0.0
+    $vramMB = 0
+    try {
+        $samples = (Get-Counter '\GPU Engine(*engtype_3D)\Utilization Percentage' -ErrorAction Stop).CounterSamples
+        foreach ($s in $samples) {
+            $v = [double]$s.CookedValue
+            if ($v -gt $gpu) { $gpu = $v }
+            foreach ($pid in @($MsfsPids)) {
+                if ($s.InstanceName -like "pid_${pid}_*") { $msfsGpu += $v }
+            }
+        }
+        if ($msfsGpu -gt 100) { $msfsGpu = 100 }
+        if ($msfsGpu -gt $gpu) { $gpu = $msfsGpu }
+    } catch { }
+    try {
+        $vs = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage' -ErrorAction Stop).CounterSamples
+        $max = ($vs | Measure-Object -Property CookedValue -Maximum).Maximum
+        $vramMB = [int]($max / 1MB)
+    } catch { }
+    return @{ Gpu = $gpu; MsfsGpu = $msfsGpu; VramMB = $vramMB }
+}
+
+function Get-HardwareSample {
+    param([int[]]$MsfsPids)
+    $cpu = 0.0
+    $diskQ = 0.0
+    $diskMBps = 0.0
+    $netMBps = 0.0
+    if ($script:HwReady) {
+        try { $cpu = [double]$script:PcCpu.NextValue() } catch { }
+        try { $diskQ = [double]$script:PcDiskQ.NextValue() } catch { }
+        try { $diskMBps = [double]$script:PcDiskB.NextValue() / 1MB } catch { }
+        foreach ($c in @($script:PcNet)) {
+            try { $netMBps += [double]$c.NextValue() / 1MB } catch { }
+        }
+    }
+    $gpu = @{ Gpu = 0.0; MsfsGpu = 0.0; VramMB = 0 }
+    if (($script:TickIndex % 2) -eq 0) {
+        $gpu = Get-GpuSample $MsfsPids
+        $script:LastGpu = $gpu
+    } elseif ($script:LastGpu) {
+        $gpu = $script:LastGpu
+    }
+    return @{
+        SysCpu   = $cpu
+        DiskQ    = $diskQ
+        DiskMBps = $diskMBps
+        NetMBps  = $netMBps
+        Gpu      = [double]$gpu.Gpu
+        MsfsGpu  = [double]$gpu.MsfsGpu
+        VramMB   = [int]$gpu.VramMB
+    }
+}
+
+function Get-BottleneckName {
+    param($Hw, [double]$MsfsCpu, [int]$FreeRamMB)
+    if ($FreeRamMB -gt 0 -and $FreeRamMB -lt 2048) { return 'RAM' }
+    if ($Hw.DiskQ -ge 2.5 -or $Hw.DiskMBps -ge 80) { return 'Disk' }
+    if ($Hw.NetMBps -ge 20) { return 'Network' }
+    $cap = 0
+    if ($script:Session -and $script:Session.ContainsKey('FrameLimiter')) {
+        try { $cap = [int]$script:Session.FrameLimiter } catch { }
+    }
+    $fps = 0.0
+    if ($null -ne $script:LastFps) { $fps = [double]$script:LastFps }
+    if ($cap -ge 15 -and $cap -le 90 -and $fps -ge ($cap * 0.92)) {
+        $gpuCap = [math]::Max($Hw.Gpu, $Hw.MsfsGpu)
+        if ($gpuCap -lt 85 -and $MsfsCpu -lt 20 -and $Hw.DiskQ -lt 2) { return 'Cap' }
+    }
+    $gpu = [math]::Max($Hw.Gpu, $Hw.MsfsGpu)
+    if ($gpu -ge 88 -and $MsfsCpu -lt 22) { return 'GPU' }
+    if ($MsfsCpu -ge 14 -or $Hw.SysCpu -ge 82) { return 'CPU' }
+    if ($gpu -ge 78) { return 'GPU' }
+    return 'None'
+}
+
+function Ensure-FrameProbe {
+    $exe = Join-Path $script:Root 'MsfsFrameProbe.exe'
+    $cs = Join-Path $script:Root 'MsfsFrameProbe.cs'
+    $dll = Join-Path $script:Root 'SimConnect.dll'
+    if (-not (Test-Path -LiteralPath $dll)) {
+        $sdk = 'C:\MSFS 2024 SDK\SimConnect SDK\lib\SimConnect.dll'
+        if (Test-Path -LiteralPath $sdk) {
+            try { Copy-Item -LiteralPath $sdk -Destination $dll -Force } catch { }
+        }
+    }
+    $needBuild = -not (Test-Path -LiteralPath $exe)
+    if (-not $needBuild -and (Test-Path -LiteralPath $cs) -and (Test-Path -LiteralPath $exe)) {
+        if ((Get-Item -LiteralPath $cs).LastWriteTime -gt (Get-Item -LiteralPath $exe).LastWriteTime) { $needBuild = $true }
+    }
+    if ($needBuild -and (Test-Path -LiteralPath $cs)) {
+        $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+        if (Test-Path -LiteralPath $csc) {
+            try {
+                $p = Start-Process -FilePath $csc -ArgumentList @('/nologo', '/optimize', '/target:winexe', "/out:$exe", $cs) -Wait -PassThru -WindowStyle Hidden
+                if ($p.ExitCode -eq 0) { Write-Log 'Built MsfsFrameProbe.exe (SimConnect FPS)' 'OK' }
+            } catch {
+                Write-Log ("Frame probe compile failed: {0}" -f $_.Exception.Message) 'WARN'
+            }
+        }
+    }
+    $script:FrameProbeExe = $(if (Test-Path -LiteralPath $exe) { $exe } else { $null })
+}
+
+function Read-MsfsInternalSettings {
+    $out = @{
+        Path            = $null
+        FrameLimiter    = 0
+        VSync           = $false
+        DynamicSettings = $false
+        TargetFrameRate = 0
+        FrameGeneration = 'NONE'
+        AntiAliasing    = ''
+        FsrMode         = ''
+        Tlod            = 0.0
+        Olod            = 0.0
+        CloudsQuality   = -1
+        TrafficQty      = -1
+        Buildings       = -1
+    }
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.Limitless_8wekyb3d8bbwe\LocalCache\UserCfg.opt'),
+        (Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.FlightSimulator_8wekyb3d8bbwe\LocalCache\UserCfg.opt')
+    )
+    $path = $null
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { $path = $c; break }
+    }
+    if (-not $path) { return $out }
+    $out.Path = $path
+    $text = Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue
+    if (-not $text) { return $out }
+    if ($text -match '(?m)^\s*FrameLimiter\s+(\d+)') { $out.FrameLimiter = [int]$Matches[1] }
+    if ($text -match '(?m)^\s*VSync\s+(\d+)') { $out.VSync = ([int]$Matches[1] -ne 0) }
+    if ($text -match '(?m)^\s*DynamicSettings\s+(\d+)') { $out.DynamicSettings = ([int]$Matches[1] -ne 0) }
+    if ($text -match '(?m)^\s*TargetFrameRate\s+(\d+)') { $out.TargetFrameRate = [int]$Matches[1] }
+    if ($text -match '(?m)^\s*FrameGeneration\s+(\S+)') { $out.FrameGeneration = [string]$Matches[1] }
+    if ($text -match '(?m)^\s*AntiAliasing\s+(\S+)') { $out.AntiAliasing = [string]$Matches[1] }
+    if ($text -match '(?m)^\s*FSRMode\s+(\S+)') { $out.FsrMode = [string]$Matches[1] }
+    $gIdx = $text.IndexOf('{Graphics')
+    $gVr = $text.IndexOf('{GraphicsVR')
+    if ($gIdx -ge 0) {
+        $end = $text.Length
+        if ($gVr -gt $gIdx) { $end = $gVr }
+        $gfx = $text.Substring($gIdx, $end - $gIdx)
+        if ($gfx -match '(?s)\{Terrain[^\{\}]*LoDFactor\s+([0-9.]+)') { $out.Tlod = [double]$Matches[1] }
+        if ($gfx -match '(?s)\{ObjectsLoD[^\{\}]*LoDFactor\s+([0-9.]+)') { $out.Olod = [double]$Matches[1] }
+        if ($gfx -match '(?s)\{VolumetricClouds[^\{\}]*Quality\s+(\d+)') { $out.CloudsQuality = [int]$Matches[1] }
+        if ($gfx -match '(?s)\{Traffic[^\{\}]*AircraftTrafficQuantity\s+(-?\d+)') { $out.TrafficQty = [int]$Matches[1] }
+        if ($gfx -match '(?s)\{Buildings[^\{\}]*Quality\s+(\d+)') { $out.Buildings = [int]$Matches[1] }
+    }
+    return $out
+}
+
+function Get-QualityName {
+    param([int]$Q)
+    switch ($Q) {
+        0 { return 'Low' }
+        1 { return 'Medium' }
+        2 { return 'High' }
+        3 { return 'Ultra' }
+        default { return "$Q" }
+    }
+}
+
+function Start-FpsCapture {
+    $script:PresentMonPid = $null
+    $script:SimConnectPid = $null
+    $script:FpsSource = $null
+    $script:PresentMonFile = Join-Path $script:LogDir 'presentmon-live.csv'
+    $script:SimConnectJson = Join-Path $script:LogDir 'simconnect-live.json'
+    $script:SimConnectCsv = Join-Path $script:LogDir 'simconnect-live.csv'
+    foreach ($f in @($script:SimConnectJson, $script:SimConnectCsv, "$($script:SimConnectJson).tmp")) {
+        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    }
+    if ($script:FrameProbeExe -and (Test-Path -LiteralPath $script:FrameProbeExe)) {
+        try {
+            Get-Process MsfsFrameProbe -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $script:FrameProbeExe
+            $psi.Arguments = '--json "' + $script:SimConnectJson + '" --csv "' + $script:SimConnectCsv + '" --parent ' + $PID
+            $psi.WorkingDirectory = $script:Root
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $script:SimConnectPid = $p.Id
+            Write-Log ("SimConnect FPS started (MsfsFrameProbe pid={0})" -f $p.Id) 'OK'
+        } catch {
+            Write-Log ("SimConnect FPS failed: {0}" -f $_.Exception.Message) 'WARN'
+        }
+    }
+    if (-not $script:PresentMonExe) { return }
+    try {
+        if (Test-Path -LiteralPath $script:PresentMonFile) {
+            Remove-Item -LiteralPath $script:PresentMonFile -Force -ErrorAction SilentlyContinue
+        }
+        Get-Process PresentMon-x64 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:PresentMonExe
+        $psi.Arguments = '--process_name FlightSimulator2024.exe --process_name FlightSimulator.exe --output_file "' + $script:PresentMonFile + '" --stop_existing_session --no_console_stats --exclude_dropped --v1_metrics'
+        $psi.WorkingDirectory = $script:LogDir
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $script:PresentMonPid = $p.Id
+        $script:PmMsCol = $null
+        Write-Log ("PresentMon backup started (pid={0})" -f $p.Id) 'OK'
+    } catch {
+        Write-Log ("PresentMon backup failed: {0}" -f $_.Exception.Message) 'WARN'
+    }
+}
+
+function Stop-FpsCapture {
+    $stats = @{ Count = 0; Avg = 0.0; Min = 0.0; Max = 0.0; AvgMs = 0.0; Source = 'none'; SimSpeed = 1.0 }
+    if ($script:SimConnectPid) {
+        try { Stop-Process -Id $script:SimConnectPid -Force -ErrorAction SilentlyContinue } catch { }
+        $script:SimConnectPid = $null
+        Start-Sleep -Milliseconds 250
+    }
+    if ($script:PresentMonPid) {
+        try { Stop-Process -Id $script:PresentMonPid -Force -ErrorAction SilentlyContinue } catch { }
+        $script:PresentMonPid = $null
+        Start-Sleep -Milliseconds 250
+    }
+    if ($script:SimConnectCsv -and (Test-Path -LiteralPath $script:SimConnectCsv)) {
+        try {
+            $rows = Import-Csv -LiteralPath $script:SimConnectCsv
+            $vals = New-Object System.Collections.Generic.List[double]
+            $spd = 1.0
+            foreach ($r in $rows) {
+                $v = 0.0
+                if ([double]::TryParse([string]$r.Fps, [ref]$v) -and $v -gt 1 -and $v -lt 400) { [void]$vals.Add($v) }
+                $s = 0.0
+                if ([double]::TryParse([string]$r.SimSpeed, [ref]$s) -and $s -gt 0) { $spd = $s }
+            }
+            if ($vals.Count -gt 5) {
+                $stats.Count = $vals.Count
+                $stats.Avg = [math]::Round((($vals | Measure-Object -Average).Average), 1)
+                $stats.Min = [math]::Round((($vals | Measure-Object -Minimum).Minimum), 1)
+                $stats.Max = [math]::Round((($vals | Measure-Object -Maximum).Maximum), 1)
+                if ($stats.Avg -gt 0) { $stats.AvgMs = [math]::Round(1000.0 / $stats.Avg, 1) }
+                $stats.Source = 'simconnect'
+                $stats.SimSpeed = [math]::Round($spd, 2)
+                return $stats
+            }
+        } catch {
+            Write-Log ("SimConnect FPS parse failed: {0}" -f $_.Exception.Message) 'WARN'
+        }
+    }
+    if (-not $script:PresentMonFile -or -not (Test-Path -LiteralPath $script:PresentMonFile)) { return $stats }
+    try {
+        $rows = Import-Csv -LiteralPath $script:PresentMonFile
+        $ms = New-Object System.Collections.Generic.List[double]
+        foreach ($r in $rows) {
+            $v = 0.0
+            if ($r.MsBetweenPresents) { [void][double]::TryParse([string]$r.MsBetweenPresents, [ref]$v) }
+            if ($v -gt 1 -and $v -lt 250) { [void]$ms.Add($v) }
+        }
+        if ($ms.Count -gt 5) {
+            $fps = foreach ($x in $ms) { 1000.0 / $x }
+            $stats.Count = $ms.Count
+            $stats.Avg = [math]::Round((($fps | Measure-Object -Average).Average), 1)
+            $stats.Min = [math]::Round((($fps | Measure-Object -Minimum).Minimum), 1)
+            $stats.Max = [math]::Round((($fps | Measure-Object -Maximum).Maximum), 1)
+            $stats.AvgMs = [math]::Round((($ms | Measure-Object -Average).Average), 1)
+            $stats.Source = 'presentmon'
+        }
+    } catch {
+        Write-Log ("FPS parse failed: {0}" -f $_.Exception.Message) 'WARN'
+    }
+    return $stats
+}
+
+function Update-HardwareSession {
+    param($Hw, [double]$MsfsCpu, [int]$FreeRamMB)
+    if (-not $script:Session) { return }
+    $s = $script:Session
+    if (-not $s.ContainsKey('HwSamples')) {
+        $s['HwSamples'] = 0
+        $s['GpuSum'] = 0.0; $s['GpuMax'] = 0.0
+        $s['VramMaxMB'] = 0
+        $s['DiskQSum'] = 0.0; $s['DiskQMax'] = 0.0; $s['DiskMBpsMax'] = 0.0
+        $s['NetMBpsSum'] = 0.0; $s['NetMBpsMax'] = 0.0
+        $s['SysCpuSum'] = 0.0; $s['SysCpuMax'] = 0.0
+        $s['BnCpu'] = 0; $s['BnGpu'] = 0; $s['BnRam'] = 0; $s['BnDisk'] = 0; $s['BnNet'] = 0; $s['BnCap'] = 0; $s['BnNone'] = 0
+        $s['LastLimit'] = 'None'
+    }
+    $s.HwSamples++
+    $s.GpuSum += $Hw.Gpu
+    if ($Hw.Gpu -gt $s.GpuMax) { $s.GpuMax = $Hw.Gpu }
+    if ($Hw.VramMB -gt $s.VramMaxMB) { $s.VramMaxMB = $Hw.VramMB }
+    $s.DiskQSum += $Hw.DiskQ
+    if ($Hw.DiskQ -gt $s.DiskQMax) { $s.DiskQMax = $Hw.DiskQ }
+    if ($Hw.DiskMBps -gt $s.DiskMBpsMax) { $s.DiskMBpsMax = $Hw.DiskMBps }
+    $s.NetMBpsSum += $Hw.NetMBps
+    if ($Hw.NetMBps -gt $s.NetMBpsMax) { $s.NetMBpsMax = $Hw.NetMBps }
+    $s.SysCpuSum += $Hw.SysCpu
+    if ($Hw.SysCpu -gt $s.SysCpuMax) { $s.SysCpuMax = $Hw.SysCpu }
+    $bn = Get-BottleneckName -Hw $Hw -MsfsCpu $MsfsCpu -FreeRamMB $FreeRamMB
+    $s.LastLimit = $bn
+    switch ($bn) {
+        'CPU' { $s.BnCpu++ }
+        'GPU' { $s.BnGpu++ }
+        'RAM' { $s.BnRam++ }
+        'Disk' { $s.BnDisk++ }
+        'Network' { $s.BnNet++ }
+        'Cap' { $s.BnCap++ }
+        default { $s.BnNone++ }
+    }
+}
+
+function Get-LimitSummary {
+    param($Session)
+    if (-not $Session.HwSamples -or $Session.HwSamples -le 0) {
+        return @{
+            Name      = 'Unknown'
+            DevName   = 'Limiter unknown'
+            Percent   = 0
+            When      = 'Not enough hardware samples.'
+            Detail    = 'Not enough hardware samples.'
+            GpuAvg    = 0
+            GpuMax    = 0
+            SysCpuAvg = 0
+            DiskQAvg  = 0
+            DiskQMax  = 0
+            DiskMax   = 0
+            NetAvg    = 0
+            NetMax    = 0
+            VramMaxMB = 0
+            BnCpu     = 0
+            BnGpu     = 0
+            BnRam     = 0
+            BnDisk    = 0
+            BnNet     = 0
+            BnNone    = 0
+        }
+    }
+    $map = @{
+        CPU     = [int]$Session.BnCpu
+        GPU     = [int]$Session.BnGpu
+        RAM     = [int]$Session.BnRam
+        Disk    = [int]$Session.BnDisk
+        Network = [int]$Session.BnNet
+        Cap     = [int]$Session.BnCap
+        None    = [int]$Session.BnNone
+    }
+    $top = 'None'
+    $topN = -1
+    foreach ($k in @('GPU', 'CPU', 'Disk', 'RAM', 'Network', 'Cap', 'None')) {
+        if ($map[$k] -gt $topN) { $top = $k; $topN = $map[$k] }
+    }
+    $pct = [int](100.0 * $topN / [math]::Max(1, [int]$Session.HwSamples))
+    $mix = New-Object System.Collections.Generic.List[string]
+    foreach ($k in @('GPU', 'CPU', 'Disk', 'RAM', 'Network', 'Cap')) {
+        $n = [int]$map[$k]
+        if ($n -le 0) { continue }
+        $p = [int](100.0 * $n / [math]::Max(1, [int]$Session.HwSamples))
+        if ($p -ge 5) { [void]$mix.Add(('{0} {1}%' -f $k, $p)) }
+    }
+    $when = if ($mix.Count -gt 0) { $mix -join ', ' } else { 'No limiter stood out.' }
+    $detail = switch ($top) {
+        'GPU' { 'The graphics card was the main limit (like Limited by GPU on the sim FPS display).' }
+        'CPU' { 'The processor / main thread was the main limit (like Limited by MainThread).' }
+        'RAM' { 'System memory got tight and that can hitch the sim.' }
+        'Disk' { 'The drive was busy (scenery streaming). That usually causes stutters more than a steady FPS drop.' }
+        'Network' { 'The network was busy (live weather, photogrammetry, or a download).' }
+        'Cap' { 'The sim frame-rate cap / VSync was holding FPS on purpose (same idea as a locked number on the Dev FPS display).' }
+        default { 'No single part of the PC stayed maxed out for most of the flight.' }
+    }
+    return @{
+        Name      = $top
+        DevName   = (Get-DevLimitLabel $top)
+        Percent   = $pct
+        When      = $when
+        Detail    = $detail
+        GpuAvg    = [math]::Round($Session.GpuSum / $Session.HwSamples, 1)
+        GpuMax    = [math]::Round($Session.GpuMax, 1)
+        SysCpuAvg = [math]::Round($Session.SysCpuSum / $Session.HwSamples, 1)
+        DiskQAvg  = [math]::Round($Session.DiskQSum / $Session.HwSamples, 2)
+        DiskQMax  = [math]::Round([double]$Session.DiskQMax, 2)
+        DiskMax   = [math]::Round([double]$Session.DiskMBpsMax, 1)
+        NetAvg    = [math]::Round($Session.NetMBpsSum / $Session.HwSamples, 2)
+        NetMax    = [math]::Round([double]$Session.NetMBpsMax, 2)
+        VramMaxMB = [int]$Session.VramMaxMB
+        BnCpu     = [int]$Session.BnCpu
+        BnGpu     = [int]$Session.BnGpu
+        BnRam     = [int]$Session.BnRam
+        BnDisk    = [int]$Session.BnDisk
+        BnNet     = [int]$Session.BnNet
+        BnCap     = [int]$Session.BnCap
+        BnNone    = [int]$Session.BnNone
+    }
+}
+
+function Get-DevLimitLabel {
+    param([string]$Name)
+    switch ($Name) {
+        'CPU' { return 'Limited by MainThread' }
+        'GPU' { return 'Limited by GPU' }
+        'RAM' { return 'Limited by Memory' }
+        'Disk' { return 'Limited by Disk' }
+        'Network' { return 'Limited by Network' }
+        'Cap' { return 'Limited by Frame Rate Cap' }
+        'None' { return 'No single limiter' }
+        default { return 'Limiter unknown' }
+    }
+}
+
+function Get-LiveFps {
+    if ($script:SimConnectJson -and (Test-Path -LiteralPath $script:SimConnectJson)) {
+        try {
+            $j = Get-Content -LiteralPath $script:SimConnectJson -Raw -ErrorAction Stop | ConvertFrom-Json
+            $at = [datetime]$j.at
+            if (((Get-Date) - $at).TotalSeconds -lt 6 -and [double]$j.fps -gt 1) {
+                $script:FpsSource = 'simconnect'
+                try { $script:LastSimSpeed = [double]$j.simSpeed } catch { }
+                return [math]::Round([double]$j.fps, 1)
+            }
+        } catch { }
+    }
+    $script:FpsSource = 'presentmon'
+    if (-not $script:PresentMonFile -or -not (Test-Path -LiteralPath $script:PresentMonFile)) { return $null }
+    try {
+        $fi = Get-Item -LiteralPath $script:PresentMonFile -ErrorAction Stop
+        if ($fi.Length -lt 120) { return $null }
+        $fs = [System.IO.File]::Open(
+            $script:PresentMonFile,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite
+        )
+        try {
+            if ($null -eq $script:PmMsCol) {
+                $head = New-Object System.IO.StreamReader($fs, $true)
+                $header = $head.ReadLine()
+                $script:PmMsCol = -1
+                if ($header) {
+                    $cols = $header.Split(',')
+                    for ($i = 0; $i -lt $cols.Length; $i++) {
+                        if ($cols[$i].Trim() -eq 'MsBetweenPresents') { $script:PmMsCol = $i; break }
+                    }
+                }
+            }
+            if ($script:PmMsCol -lt 0) { return $null }
+            $take = [int64][math]::Min($fi.Length, 12288)
+            [void]$fs.Seek(-$take, [System.IO.SeekOrigin]::End)
+            $sr = New-Object System.IO.StreamReader($fs, $true)
+            $tail = $sr.ReadToEnd()
+        } finally {
+            $fs.Dispose()
+        }
+        $sum = 0.0
+        $n = 0
+        foreach ($raw in $tail.Split([char]10)) {
+            $line = $raw.Trim()
+            if (-not $line -or $line.StartsWith('Application')) { continue }
+            $parts = $line.Split(',')
+            if ($parts.Length -le $script:PmMsCol) { continue }
+            $v = 0.0
+            if ([double]::TryParse($parts[$script:PmMsCol], [ref]$v) -and $v -gt 1 -and $v -lt 250) {
+                $sum += (1000.0 / $v)
+                $n++
+            }
+        }
+        if ($n -lt 4) { return $null }
+        return [math]::Round($sum / $n, 1)
+    } catch {
+        return $null
+    }
+}
+
 function Get-MsfsInfo {
     $found = New-Object System.Collections.Generic.List[object]
     foreach ($n in @($script:Config.MsfsProcessNames)) {
@@ -547,6 +1058,8 @@ function Write-RuntimeStatus {
             MsfsRunning = [bool]$script:MsfsRunning
             Admin       = [bool]$script:IsAdmin
             Label       = [string]$script:MsfsLabel
+            Fps         = $script:LastFps
+            Limit       = [string]$script:LastLimit
         }
         ($obj | ConvertTo-Json -Compress) | Set-Content -LiteralPath (Join-Path $script:LogDir 'runtime-status.json') -Encoding UTF8
     } catch { }
@@ -580,7 +1093,7 @@ function Test-NameLooksMsfsRelated {
         'orbx', 'fsuipc', 'vpilot', 'vatsim', 'simbrief', 'littlenav', 'spad',
         'mobiflight', 'xboxpc', 'webview', 'amdrs', 'radeon', 'nvidia', 'tobi',
         'trackir', 'beyondatc', 'sayintentions', 'volanta', 'onair', 'chaseplane',
-        'autofps', 'mdclient', 'maddog', 'bridge'
+        'autofps', 'mdclient', 'maddog', 'bridge', 'presentmon'
     )
     foreach ($k in $keys) {
         if ($n.Contains($k)) { return $true }
@@ -744,6 +1257,25 @@ function New-FlightSession {
     $script:Session['Actions'] = New-Object System.Collections.Generic.List[object]
     $script:Session['SuggestedNames'] = New-IgnoreSet -Names @()
     $script:Session['NearMisses'] = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+    $script:LastFps = $null
+    $script:LastLimit = 'None'
+    $script:LastSimSpeed = 1.0
+    $script:FpsSource = $null
+    $cfg = Read-MsfsInternalSettings
+    $script:Session['FrameLimiter'] = [int]$cfg.FrameLimiter
+    $script:Session['VSync'] = [bool]$cfg.VSync
+    $script:Session['DynamicSettings'] = [bool]$cfg.DynamicSettings
+    $script:Session['TargetFrameRate'] = [int]$cfg.TargetFrameRate
+    $script:Session['FrameGeneration'] = [string]$cfg.FrameGeneration
+    $script:Session['AntiAliasing'] = [string]$cfg.AntiAliasing
+    $script:Session['FsrMode'] = [string]$cfg.FsrMode
+    $script:Session['Tlod'] = [double]$cfg.Tlod
+    $script:Session['Olod'] = [double]$cfg.Olod
+    $script:Session['CloudsQuality'] = [int]$cfg.CloudsQuality
+    $script:Session['TrafficQty'] = [int]$cfg.TrafficQty
+    $script:Session['Buildings'] = [int]$cfg.Buildings
+    $script:Session['UserCfgPath'] = [string]$cfg.Path
+    if (-not $WriteTestReport) { Start-FpsCapture }
 }
 
 function Add-NearMiss {
@@ -1065,6 +1597,77 @@ function Get-SessionSuggestions {
             'When FreeRamMB is below LowRamMB, prioritize RAM in overlay sort order (score memory higher than CPU) and change the toast subtitle to mention low RAM first.'
     }
 
+    $limit = Get-LimitSummary $Session
+    $fpsAvg = 0.0
+    try { $fpsAvg = [double]$Session.FpsAvg } catch { }
+    $fpsBit = if ($fpsAvg -gt 0) { (' Average FPS was {0}.' -f $fpsAvg) } else { '' }
+
+    if ($limit.Name -eq 'GPU') {
+        $gpuFix = New-Object System.Collections.Generic.List[string]
+        if ([int]$Session.CloudsQuality -ge 2) { [void]$gpuFix.Add(('volumetric clouds ({0})' -f (Get-QualityName $Session.CloudsQuality))) }
+        if ([double]$Session.Tlod -ge 0.7) { [void]$gpuFix.Add(('terrain LOD {0:n2}' -f $Session.Tlod)) }
+        if ([int]$Session.Buildings -ge 2) { [void]$gpuFix.Add(('buildings ({0})' -f (Get-QualityName $Session.Buildings))) }
+        if ($Session.AntiAliasing -and $Session.AntiAliasing -ne 'OFF') { [void]$gpuFix.Add(('anti-aliasing {0}' -f $Session.AntiAliasing)) }
+        $gpuChange = if ($gpuFix.Count -gt 0) {
+            'In the sim graphics menu, lower: {0}. Sleeping other programs will not raise FPS much while the GPU is already full.' -f ($gpuFix -join ', ')
+        } else {
+            'Lower clouds, terrain LOD, or anti-aliasing one step. Sleeping other programs will not raise FPS much while the GPU is already full.'
+        }
+        Add-Idea 'high' 'fps' 'The graphics card was the limiter' `
+            ("{0} for {1}% of the flight ({2}).{3} GPU averaged {4}% (peak {5}%)." -f $limit.DevName, $limit.Percent, $limit.When, $fpsBit, $limit.GpuAvg, $limit.GpuMax) `
+            $gpuChange `
+            'Surface GPU-bound vs CPU-bound on the report card using SimConnect Frame + GPU Engine counters. Do not suggest Sleep for GPU-only limits.'
+    } elseif ($limit.Name -eq 'CPU') {
+        $other = [double]$Avg.OtherCpuAvg
+        $cpuFix = New-Object System.Collections.Generic.List[string]
+        if ([int]$Session.TrafficQty -ge 1) { [void]$cpuFix.Add('aircraft traffic') }
+        if ([double]$Session.Olod -ge 1.0) { [void]$cpuFix.Add(('objects LOD {0:n2}' -f $Session.Olod)) }
+        $settingsBit = if ($cpuFix.Count -gt 0) { ' Then lower {0} in the sim.' -f ($cpuFix -join ' and ') } else { ' Then lower traffic, AI aircraft, or object density.' }
+        $change = if ($other -ge 2.5) {
+            'Sleep or close other programs before you load in (they were using the processor).{0}' -f $settingsBit
+        } else {
+            'Other programs were quiet, so the sim itself is CPU-bound (Limited by MainThread).{0}' -f $settingsBit
+        }
+        Add-Idea 'high' 'fps' 'The processor / main thread was the limiter' `
+            ("{0} for {1}% of the flight ({2}).{3} Sim CPU avg {4}%. Other programs avg {5}%." -f $limit.DevName, $limit.Percent, $limit.When, $fpsBit, $Avg.MsfsCpuAvg, $other) `
+            $change `
+            'When BnCpu dominates, rank Sleep suggestions by CPU first and mention MainThread on the overlay header.'
+    } elseif ($limit.Name -eq 'Cap') {
+        $capN = [int]$Session.FrameLimiter
+        $dyn = if ([bool]$Session.DynamicSettings) { (' Dynamic Settings is on with a {0} FPS target.' -f $Session.TargetFrameRate) } else { '' }
+        $vs = if ([bool]$Session.VSync) { ' VSync is on.' } else { '' }
+        Add-Idea 'medium' 'fps' 'The sim is holding FPS on purpose' `
+            ("{0} for {1}% of the flight.{2} Your Max Frame Rate in UserCfg is {3}.{4}{5}" -f $limit.DevName, $limit.Percent, $fpsBit, $capN, $dyn, $vs) `
+            'If you want more frames, raise Max Frame Rate or turn VSync off in the sim. Hardware was not the thing holding you down.' `
+            'Treat FrameLimiter / VSync / DynamicSettings from UserCfg.opt as Limited by Frame Rate Cap on the report card.'
+    } elseif ($limit.Name -eq 'RAM') {
+        Add-Idea 'high' 'fps' 'Memory got tight and that can drop FPS' `
+            ("{0} for {1}% of the flight. Lowest free RAM {2} MB.{3}" -f $limit.DevName, $limit.Percent, $Session.FreeRamMin, $fpsBit) `
+            'Sleep browsers and other heavy apps before you load the cockpit so Windows does not start paging.' `
+            'Treat FreeRamMB under LowRamMB as a RAM limiter even if GPU/CPU are not pegged.'
+    } elseif ($limit.Name -eq 'Disk') {
+        Add-Idea 'medium' 'fps' 'The drive was busy (scenery streaming)' `
+            ("{0} for {1}% of the flight. Disk queue peak {2}, peak {3} MB/s.{4}" -f $limit.DevName, $limit.Percent, $limit.DiskQMax, $limit.DiskMax, $fpsBit) `
+            'Let the scenery cache settle after you load in. Pause OneDrive or other downloads during flight. Stutters are more likely than a lower locked FPS.' `
+            'Keep disk as a hitch limiter, not a steady-FPS limiter, on the report card.'
+    } elseif ($limit.Name -eq 'Network') {
+        Add-Idea 'medium' 'fps' 'The network was busy during the flight' `
+            ("{0} for {1}% of the flight. Average {2} MB/s (peak {3}).{4}" -f $limit.DevName, $limit.Percent, $limit.NetAvg, $limit.NetMax, $fpsBit) `
+            'Turn off photogrammetry or pause other downloads if FPS dips near airports. Live weather can hitch the sim the same way.' `
+            'Treat high Network Interface Bytes/sec as Limited by Network on the report card.'
+    } elseif ($fpsAvg -gt 0 -and $fpsAvg -lt 28 -and $limit.Name -in @('None', 'Unknown')) {
+        Add-Idea 'medium' 'fps' 'FPS was low without a maxed-out part' `
+            ("Average FPS was {0} but CPU, GPU, RAM, disk, and network were not pegged for most of the flight." -f $fpsAvg) `
+            $(if ([int]$Session.FrameLimiter -ge 15 -and [int]$Session.FrameLimiter -le 90) {
+                    'Your sim Max Frame Rate is {0}. Raise it if you want more FPS, or leave it if that cap is on purpose.' -f $Session.FrameLimiter
+                } elseif ([bool]$Session.VSync) {
+                    'VSync is on in the sim. That can lock FPS to the monitor. Turn it off or use a higher Max Frame Rate if you want more frames.'
+                } else {
+                    'Check VSync, a frame-rate cap, or AutoFPS. A limiter in the sim settings can hold FPS down on purpose.'
+                }) `
+            'If FPS is low and no hardware limiter is set, mention frame-cap / VSync / AutoFPS on the report card.'
+    }
+
     if ($Session.CooldownSamples -gt [int]($Session.Samples * 0.2) -and $Session.Dismissed -gt 0) {
         Add-Idea 'low' 'detection' 'Long quiet window after Not now' `
             ("{0} of {1} samples were in dismiss-cooldown. Later hogs may have been skipped." -f $Session.CooldownSamples, $Session.Samples) `
@@ -1130,6 +1733,21 @@ function Get-SessionScore {
         $score -= 6
         [void]$notes.Add('- watching was paused for much of the flight')
     }
+    $limitNote = Get-LimitSummary $Session
+    if ($limitNote.Name -eq 'GPU') {
+        [void]$notes.Add('+ graphics card was the limiter (settings, not other programs)')
+    } elseif ($limitNote.Name -eq 'CPU' -and $Avg.OtherCpuAvg -ge 2.5) {
+        $score -= 4
+        [void]$notes.Add('- main thread limited while other programs still used CPU')
+    } elseif ($limitNote.Name -eq 'CPU') {
+        [void]$notes.Add('+ Limited by MainThread with other programs quiet')
+    } elseif ($limitNote.Name -eq 'RAM') {
+        $score -= 4
+        [void]$notes.Add('- memory limiter (low free RAM)')
+    }
+    if ([double]$Session.FpsAvg -gt 0) {
+        [void]$notes.Add(('+ FPS captured: avg {0}' -f $Session.FpsAvg))
+    }
 
     if ($score -gt 100) { $score = 100 }
     if ($score -lt 0) { $score = 0 }
@@ -1184,6 +1802,25 @@ function Build-SessionMarkdown {
     $freeMin = if ($Session.FreeRamMin -eq [int]::MaxValue) { 0 } else { $Session.FreeRamMin }
     [void]$lines.Add(('| Free RAM | avg {0} MB  min {1} MB |' -f $Avg.FreeRamAvgMB, $freeMin))
     [void]$lines.Add(('| Other programs CPU | avg {0}% |' -f $Avg.OtherCpuAvg))
+    $limit = Get-LimitSummary $Session
+    $fpsAvg = 0.0
+    try { $fpsAvg = [double]$Session.FpsAvg } catch { }
+    if ($fpsAvg -gt 0) {
+        $src = if ($Session.FpsSource -eq 'simconnect') { 'sim (SimConnect Frame)' } else { $Session.FpsSource }
+        [void]$lines.Add(('| FPS | avg {0}  min {1}  max {2}  ({3} ms/frame) via {4} |' -f $Session.FpsAvg, $Session.FpsMin, $Session.FpsMax, $Session.FpsAvgMs, $src))
+    } else {
+        [void]$lines.Add('| FPS | not captured (SimConnect/PresentMon missing or too few frames) |')
+    }
+    if ($Session.ContainsKey('FrameLimiter')) {
+        [void]$lines.Add(('| Sim settings | cap {0}  VSync {1}  dynamic {2} (target {3})  FG {4} |' -f $Session.FrameLimiter, $Session.VSync, $Session.DynamicSettings, $Session.TargetFrameRate, $Session.FrameGeneration))
+        [void]$lines.Add(('| Sim detail | TLOD {0:n2}  OLOD {1:n2}  clouds {2}  traffic {3} |' -f $Session.Tlod, $Session.Olod, $Session.CloudsQuality, $Session.TrafficQty))
+    }
+    [void]$lines.Add(('| Limiter | {0} ({1}% of samples) |' -f $limit.DevName, $limit.Percent))
+    [void]$lines.Add(('| Limiter mix | {0} |' -f $limit.When))
+    [void]$lines.Add(('| GPU | avg {0}%  peak {1}%  VRAM peak {2} MB |' -f $limit.GpuAvg, $limit.GpuMax, $limit.VramMaxMB))
+    [void]$lines.Add(('| Whole-PC CPU | avg {0}% |' -f $limit.SysCpuAvg))
+    [void]$lines.Add(('| Disk | queue avg {0}  peak {1}  peak {2} MB/s |' -f $limit.DiskQAvg, $limit.DiskQMax, $limit.DiskMax))
+    [void]$lines.Add(('| Network | avg {0} MB/s  peak {1} MB/s |' -f $limit.NetAvg, $limit.NetMax))
     [void]$lines.Add(('| Overlays shown | {0} |' -f $Session.ToastShown))
     [void]$lines.Add(('| Sleep / Close | {0} ok, {1} failed / {2} ok, {3} failed |' -f $Session.SleepOk, $Session.SleepFail, $Session.CloseOk, $Session.CloseFail))
     [void]$lines.Add(('| Ignore / Never / Dismiss | {0} / {1} / {2} |' -f $Session.Ignored, $Session.Never, $Session.Dismissed))
@@ -1195,6 +1832,12 @@ function Build-SessionMarkdown {
     } else {
         foreach ($n in $ScoreInfo.Notes) { [void]$lines.Add("- $n") }
     }
+    [void]$lines.Add('')
+    [void]$lines.Add('## What limited FPS')
+    [void]$lines.Add('')
+    [void]$lines.Add($limit.Detail)
+    [void]$lines.Add('')
+    [void]$lines.Add(('Limiter mix across the flight: {0}' -f $limit.When))
     [void]$lines.Add('')
     [void]$lines.Add('## Suggestions shown')
     [void]$lines.Add('')
@@ -1255,13 +1898,16 @@ function Get-UserFacingIdeas {
     param($Ideas)
     $out = New-Object System.Collections.Generic.List[object]
     foreach ($idea in @($Ideas)) {
+        if ($null -eq $idea) { continue }
+        if ($idea -is [string]) { continue }
         $area = Get-ScalarText $idea.Area
         $title = Get-ScalarText $idea.Title
+        if (-not $title) { continue }
         if ($area -eq 'none' -or $area -eq 'lists') { continue }
         if ($title -like 'Missed heavy program*') { continue }
         [void]$out.Add($idea)
     }
-    return , $out.ToArray()
+    return $out
 }
 
 function Show-UserReportCard {
@@ -1272,7 +1918,7 @@ function Show-UserReportCard {
     $f.MaximizeBox = $false
     $f.MinimizeBox = $false
     $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-    $f.Size = New-Object System.Drawing.Size 460, 520
+    $f.Size = New-Object System.Drawing.Size 500, 680
     $f.BackColor = $script:C.Bg
     $f.ForeColor = $script:C.Text
     $f.TopMost = $true
@@ -1308,10 +1954,39 @@ function Show-UserReportCard {
     $closed = @($Payload.Actions | Where-Object { $_.Type -eq 'close' -and $_.Ok } | ForEach-Object { Get-FriendlyName $_.Name })
     $what = New-Object System.Collections.Generic.List[string]
     [void]$what.Add(('Simulator: {0}' -f $Payload.Sim))
-    [void]$what.Add(('MSFS CPU avg {0}% (peak {1}%)' -f $Payload.MsfsCpuAvg, $Payload.MsfsCpuMax))
-    [void]$what.Add(('MSFS RAM avg {0} GB (peak {1} GB)' -f $Payload.MsfsRamAvgGB, $Payload.MsfsRamMaxGB))
+    if ([double]$Payload.FpsAvg -gt 0) {
+        $src = if ($Payload.FpsSource -eq 'simconnect') { 'sim FPS' } else { 'display FPS' }
+        [void]$what.Add(('{0} avg {1}  (low {2}, high {3})  -  {4} ms/frame' -f $src, $Payload.FpsAvg, $Payload.FpsMin, $Payload.FpsMax, $Payload.FpsAvgMs))
+    } else {
+        [void]$what.Add('FPS: not captured this flight')
+    }
+    $setBits = New-Object System.Collections.Generic.List[string]
+    if ([int]$Payload.FrameLimiter -gt 0) { [void]$setBits.Add(('Max frame rate {0}' -f $Payload.FrameLimiter)) }
+    if ([bool]$Payload.VSync) { [void]$setBits.Add('VSync on') }
+    if ([bool]$Payload.DynamicSettings) { [void]$setBits.Add(('Dynamic settings target {0}' -f $Payload.TargetFrameRate)) }
+    if ($Payload.FrameGeneration -and $Payload.FrameGeneration -ne 'NONE') { [void]$setBits.Add(('Frame gen {0}' -f $Payload.FrameGeneration)) }
+    if ([double]$Payload.Tlod -gt 0) { [void]$setBits.Add(('TLOD {0:n2}' -f $Payload.Tlod)) }
+    if ([double]$Payload.Olod -gt 0) { [void]$setBits.Add(('OLOD {0:n2}' -f $Payload.Olod)) }
+    if ([int]$Payload.CloudsQuality -ge 0) { [void]$setBits.Add(('Clouds {0}' -f (Get-QualityName $Payload.CloudsQuality))) }
+    if ($setBits.Count -gt 0) { [void]$what.Add(('Sim settings: {0}' -f ($setBits -join ', '))) }
+    if ($Payload.LimitDevName) {
+        [void]$what.Add(('{0}  ({1}% of the flight)' -f $Payload.LimitDevName, $Payload.LimitPercent))
+        if ($Payload.LimitWhen) { [void]$what.Add(('Limiter mix: {0}' -f $Payload.LimitWhen)) }
+    }
+    [void]$what.Add(('CPU: sim {0}% avg (peak {1}%)  |  whole PC {2}% avg' -f $Payload.MsfsCpuAvg, $Payload.MsfsCpuMax, $Payload.SysCpuAvg))
+    if ($null -ne $Payload.GpuAvg) {
+        $vram = if ([int]$Payload.VramMaxMB -gt 0) { '  |  VRAM peak {0:n1} GB' -f ($Payload.VramMaxMB / 1024.0) } else { '' }
+        [void]$what.Add(('GPU: {0}% avg (peak {1}%){2}' -f $Payload.GpuAvg, $Payload.GpuMax, $vram))
+    }
+    [void]$what.Add(('RAM: sim {0} GB avg (peak {1} GB)' -f $Payload.MsfsRamAvgGB, $Payload.MsfsRamMaxGB))
     if ($Payload.FreeRamMinMB) {
         [void]$what.Add(('Lowest free RAM: {0:n1} GB' -f ($Payload.FreeRamMinMB / 1024.0)))
+    }
+    if ($null -ne $Payload.DiskQAvg) {
+        [void]$what.Add(('Disk: queue avg {0} (peak {1})  |  peak {2} MB/s' -f $Payload.DiskQAvg, $Payload.DiskQMax, $Payload.DiskMBpsMax))
+    }
+    if ($null -ne $Payload.NetAvgMBps) {
+        [void]$what.Add(('Network: avg {0} MB/s (peak {1} MB/s)' -f $Payload.NetAvgMBps, $Payload.NetMaxMBps))
     }
     if ($slept.Count -gt 0) { [void]$what.Add(('Put to sleep: {0}' -f ($slept -join ', '))) }
     if ($closed.Count -gt 0) { [void]$what.Add(('Closed: {0}' -f ($closed -join ', '))) }
@@ -1323,29 +1998,29 @@ function Show-UserReportCard {
     $body.ForeColor = $script:C.Text
     $body.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $body.Location = New-Object System.Drawing.Point 22, $y
-    $body.Size = New-Object System.Drawing.Size 400, 150
+    $body.Size = New-Object System.Drawing.Size 450, 260
     $f.Controls.Add($body)
-    $y += 158
+    $y += 268
 
     $userIdeas = @(Get-UserFacingIdeas $Payload.Suggestions)
     $next = New-Object System.Windows.Forms.Label
     $next.Font = New-Object System.Drawing.Font('Segoe UI', 9)
     $next.ForeColor = $script:C.Muted
     $next.Location = New-Object System.Drawing.Point 22, $y
-    $next.Size = New-Object System.Drawing.Size 400, 140
+    $next.Size = New-Object System.Drawing.Size 450, 150
     if ($userIdeas.Count -eq 0) {
         $next.Text = 'Nothing else you need to do. The sim had enough RAM and the guard stayed out of the way of add-ons.'
     } else {
         $bits = New-Object System.Collections.Generic.List[string]
         [void]$bits.Add('Next time:')
         foreach ($idea in ($userIdeas | Select-Object -First 3)) {
-            [void]$bits.Add(('• {0}' -f (Get-ScalarText $idea.Change)))
+            [void]$bits.Add(('- {0}' -f (Get-ScalarText $idea.Change)))
         }
         $next.Text = ($bits -join [Environment]::NewLine)
     }
     $f.Controls.Add($next)
 
-    $btn = New-FlatButton 'Done' 300 440 110 32 $script:C.Ok ([System.Drawing.Color]::FromArgb(20, 28, 24))
+    $btn = New-FlatButton 'Done' 340 600 110 32 $script:C.Ok ([System.Drawing.Color]::FromArgb(20, 28, 24))
     $btn.Add_Click({ $f.Close() })
     $f.Controls.Add($btn)
     [void]$f.ShowDialog()
@@ -1432,6 +2107,11 @@ function Update-GrokBriefing {
     [void]$lines.Add(('| MSFS CPU | avg {0}% max {1}% |' -f $LatestPayload.MsfsCpuAvg, $LatestPayload.MsfsCpuMax))
     [void]$lines.Add(('| MSFS RAM | avg {0} GB max {1} GB |' -f $LatestPayload.MsfsRamAvgGB, $LatestPayload.MsfsRamMaxGB))
     [void]$lines.Add(('| Other CPU | avg {0}% |' -f $LatestPayload.OtherCpuAvg))
+    [void]$lines.Add(('| FPS | avg {0} min {1} max {2} via {3} |' -f $LatestPayload.FpsAvg, $LatestPayload.FpsMin, $LatestPayload.FpsMax, $LatestPayload.FpsSource))
+    [void]$lines.Add(('| Sim settings | cap {0} VSync {1} TLOD {2} clouds {3} |' -f $LatestPayload.FrameLimiter, $LatestPayload.VSync, $LatestPayload.Tlod, $LatestPayload.CloudsQuality))
+    [void]$lines.Add(('| Limiter | {0} ({1}%) mix {2} |' -f $LatestPayload.LimitDevName, $LatestPayload.LimitPercent, $LatestPayload.LimitWhen))
+    [void]$lines.Add(('| GPU / VRAM | avg {0}% peak {1}% / {2} MB |' -f $LatestPayload.GpuAvg, $LatestPayload.GpuMax, $LatestPayload.VramMaxMB))
+    [void]$lines.Add(('| Disk / Net | q {0} peak {1} MB/s / avg {2} MB/s |' -f $LatestPayload.DiskQAvg, $LatestPayload.DiskMBpsMax, $LatestPayload.NetAvgMBps))
     [void]$lines.Add(('| Overlays / Sleep ok / Fail | {0} / {1} / {2} |' -f $LatestPayload.ToastShown, $LatestPayload.SleepOk, $LatestPayload.SleepFail))
     [void]$lines.Add('')
     foreach ($n in @($LatestPayload.ScoreNotes)) {
@@ -1499,6 +2179,11 @@ function Write-GrokSessionNotes {
     [void]$lines.Add(('- Samples: {0}; tick avg {1} ms (max {2} ms); errors {3}' -f $Payload.Samples, $Payload.TickMsAvg, $Payload.TickMsMax, $Payload.TickErrors))
     [void]$lines.Add(('- MSFS CPU avg {0}% peak {1}%; RAM avg {2} GB peak {3} GB' -f $Payload.MsfsCpuAvg, $Payload.MsfsCpuMax, $Payload.MsfsRamAvgGB, $Payload.MsfsRamMaxGB))
     [void]$lines.Add(('- Other programs CPU avg {0}%' -f $Payload.OtherCpuAvg))
+    [void]$lines.Add(('- FPS avg {0} min {1} max {2} ({3} ms) samples {4} via {5}' -f $Payload.FpsAvg, $Payload.FpsMin, $Payload.FpsMax, $Payload.FpsAvgMs, $Payload.FpsCount, $Payload.FpsSource))
+    [void]$lines.Add(('- Sim UserCfg: cap {0}, VSync {1}, dynamic {2}/{3}, FG {4}, TLOD {5}, OLOD {6}, clouds {7}, traffic {8}' -f $Payload.FrameLimiter, $Payload.VSync, $Payload.DynamicSettings, $Payload.TargetFrameRate, $Payload.FrameGeneration, $Payload.Tlod, $Payload.Olod, $Payload.CloudsQuality, $Payload.TrafficQty))
+    [void]$lines.Add(('- Limiter: {0} ({1}%) mix {2}' -f $Payload.LimitDevName, $Payload.LimitPercent, $Payload.LimitWhen))
+    [void]$lines.Add(('- GPU avg {0}% peak {1}% VRAM {2} MB; sys CPU {3}%; disk q {4}/{5} {6} MB/s; net {7}/{8} MB/s' -f $Payload.GpuAvg, $Payload.GpuMax, $Payload.VramMaxMB, $Payload.SysCpuAvg, $Payload.DiskQAvg, $Payload.DiskQMax, $Payload.DiskMBpsMax, $Payload.NetAvgMBps, $Payload.NetMaxMBps))
+    [void]$lines.Add(('- Bottleneck counts CPU/GPU/RAM/Disk/Net/None: {0}/{1}/{2}/{3}/{4}/{5}' -f $Payload.BnCpu, $Payload.BnGpu, $Payload.BnRam, $Payload.BnDisk, $Payload.BnNet, $Payload.BnNone))
     [void]$lines.Add(('- Overlays shown: {0}; Sleep ok/fail {1}/{2}; Close ok/fail {3}/{4}; Dismiss {5}' -f $Payload.ToastShown, $Payload.SleepOk, $Payload.SleepFail, $Payload.CloseOk, $Payload.CloseFail, $Payload.Dismissed))
     [void]$lines.Add('')
     foreach ($n in @($Payload.ScoreNotes)) {
@@ -1563,6 +2248,18 @@ function Complete-FlightSession {
     $session = $script:Session
     $script:Session = $null
     if (-not $session) { return }
+    $fps = Stop-FpsCapture
+    if (-not $session.FpsCount -or [int]$session.FpsCount -le 0) {
+        $session['FpsCount'] = [int]$fps.Count
+        $session['FpsAvg'] = [double]$fps.Avg
+        $session['FpsMin'] = [double]$fps.Min
+        $session['FpsMax'] = [double]$fps.Max
+        $session['FpsAvgMs'] = [double]$fps.AvgMs
+        $session['FpsSource'] = [string]$fps.Source
+        $session['SimSpeed'] = [double]$fps.SimSpeed
+    }
+    $script:LastFps = $null
+    $script:LastLimit = 'None'
     if (-not [bool]$script:Config.WriteSessionReports) { return }
 
     $session.EndedAt = Get-Date
@@ -1607,7 +2304,7 @@ function Complete-FlightSession {
             [void]$topPrograms.Add($row)
         }
         $payload = New-Object PSObject
-        Add-Member -InputObject $payload -NotePropertyName SchemaVersion -NotePropertyValue 1
+        Add-Member -InputObject $payload -NotePropertyName SchemaVersion -NotePropertyValue 2
         Add-Member -InputObject $payload -NotePropertyName Id -NotePropertyValue ([string]$session.Id)
         Add-Member -InputObject $payload -NotePropertyName StartedAt -NotePropertyValue $startAt.ToString('o')
         Add-Member -InputObject $payload -NotePropertyName EndedAt -NotePropertyValue $endAt.ToString('o')
@@ -1659,6 +2356,44 @@ function Complete-FlightSession {
                 })
         }
         Add-Member -InputObject $payload -NotePropertyName NearMisses -NotePropertyValue $near
+        $limit = Get-LimitSummary $session
+        Add-Member -InputObject $payload -NotePropertyName FpsAvg -NotePropertyValue ([double]$session.FpsAvg)
+        Add-Member -InputObject $payload -NotePropertyName FpsMin -NotePropertyValue ([double]$session.FpsMin)
+        Add-Member -InputObject $payload -NotePropertyName FpsMax -NotePropertyValue ([double]$session.FpsMax)
+        Add-Member -InputObject $payload -NotePropertyName FpsAvgMs -NotePropertyValue ([double]$session.FpsAvgMs)
+        Add-Member -InputObject $payload -NotePropertyName FpsCount -NotePropertyValue ([int]$session.FpsCount)
+        Add-Member -InputObject $payload -NotePropertyName FpsSource -NotePropertyValue ($(if ($session.FpsSource) { [string]$session.FpsSource } else { 'none' }))
+        Add-Member -InputObject $payload -NotePropertyName SimSpeed -NotePropertyValue ($(if ($session.SimSpeed) { [double]$session.SimSpeed } else { 1.0 }))
+        Add-Member -InputObject $payload -NotePropertyName FrameLimiter -NotePropertyValue ([int]$session.FrameLimiter)
+        Add-Member -InputObject $payload -NotePropertyName VSync -NotePropertyValue ([bool]$session.VSync)
+        Add-Member -InputObject $payload -NotePropertyName DynamicSettings -NotePropertyValue ([bool]$session.DynamicSettings)
+        Add-Member -InputObject $payload -NotePropertyName TargetFrameRate -NotePropertyValue ([int]$session.TargetFrameRate)
+        Add-Member -InputObject $payload -NotePropertyName FrameGeneration -NotePropertyValue ([string]$session.FrameGeneration)
+        Add-Member -InputObject $payload -NotePropertyName AntiAliasing -NotePropertyValue ([string]$session.AntiAliasing)
+        Add-Member -InputObject $payload -NotePropertyName Tlod -NotePropertyValue ([double]$session.Tlod)
+        Add-Member -InputObject $payload -NotePropertyName Olod -NotePropertyValue ([double]$session.Olod)
+        Add-Member -InputObject $payload -NotePropertyName CloudsQuality -NotePropertyValue ([int]$session.CloudsQuality)
+        Add-Member -InputObject $payload -NotePropertyName TrafficQty -NotePropertyValue ([int]$session.TrafficQty)
+        Add-Member -InputObject $payload -NotePropertyName LimitName -NotePropertyValue ([string]$limit.Name)
+        Add-Member -InputObject $payload -NotePropertyName LimitDevName -NotePropertyValue ([string]$limit.DevName)
+        Add-Member -InputObject $payload -NotePropertyName LimitPercent -NotePropertyValue ([int]$limit.Percent)
+        Add-Member -InputObject $payload -NotePropertyName LimitWhen -NotePropertyValue ([string]$limit.When)
+        Add-Member -InputObject $payload -NotePropertyName LimitDetail -NotePropertyValue ([string]$limit.Detail)
+        Add-Member -InputObject $payload -NotePropertyName GpuAvg -NotePropertyValue ([double]$limit.GpuAvg)
+        Add-Member -InputObject $payload -NotePropertyName GpuMax -NotePropertyValue ([double]$limit.GpuMax)
+        Add-Member -InputObject $payload -NotePropertyName SysCpuAvg -NotePropertyValue ([double]$limit.SysCpuAvg)
+        Add-Member -InputObject $payload -NotePropertyName DiskQAvg -NotePropertyValue ([double]$limit.DiskQAvg)
+        Add-Member -InputObject $payload -NotePropertyName DiskQMax -NotePropertyValue ([double]$limit.DiskQMax)
+        Add-Member -InputObject $payload -NotePropertyName DiskMBpsMax -NotePropertyValue ([double]$limit.DiskMax)
+        Add-Member -InputObject $payload -NotePropertyName NetAvgMBps -NotePropertyValue ([double]$limit.NetAvg)
+        Add-Member -InputObject $payload -NotePropertyName NetMaxMBps -NotePropertyValue ([double]$limit.NetMax)
+        Add-Member -InputObject $payload -NotePropertyName VramMaxMB -NotePropertyValue ([int]$limit.VramMaxMB)
+        Add-Member -InputObject $payload -NotePropertyName BnCpu -NotePropertyValue ([int]$limit.BnCpu)
+        Add-Member -InputObject $payload -NotePropertyName BnGpu -NotePropertyValue ([int]$limit.BnGpu)
+        Add-Member -InputObject $payload -NotePropertyName BnRam -NotePropertyValue ([int]$limit.BnRam)
+        Add-Member -InputObject $payload -NotePropertyName BnDisk -NotePropertyValue ([int]$limit.BnDisk)
+        Add-Member -InputObject $payload -NotePropertyName BnNet -NotePropertyValue ([int]$limit.BnNet)
+        Add-Member -InputObject $payload -NotePropertyName BnNone -NotePropertyValue ([int]$limit.BnNone)
         Add-Member -InputObject $payload -NotePropertyName Markdown -NotePropertyValue $md
         $paths = Write-SessionFiles $payload $stamp $session.MsfsName
         Write-GrokSessionNotes -Payload $payload -Stamp $stamp -Sim $session.MsfsName
@@ -2148,7 +2883,14 @@ function Rebuild-Dashboard {
     if ($script:LastSessionGrade) {
         $last = '   |   last session {0} ({1})' -f $script:LastSessionGrade, $script:LastSessionScore
     }
-    $script:DashStatus.Text = "$msfs`r`n$ram   |   $pause$last"
+    $hw = ''
+    if ($script:MsfsRunning) {
+        if ($null -ne $script:LastFps) { $hw = '   |   {0} FPS' -f $script:LastFps }
+        if ($script:LastLimit -and $script:LastLimit -ne 'None') {
+            $hw += '   |   {0}' -f (Get-DevLimitLabel $script:LastLimit)
+        }
+    }
+    $script:DashStatus.Text = "$msfs`r`n$ram   |   $pause$last$hw"
     $script:DashStripe.BackColor = if ($script:MsfsRunning) {
         if ($script:Slept.Count -gt 0 -or $script:ToastVisible) { $script:C.Warn } else { $script:C.Ok }
     } else { $script:C.Accent }
@@ -2192,7 +2934,7 @@ function Update-Badge {
         $script:BadgeStatus.Text = 'paused'
         $script:BadgeStripe.BackColor = $script:C.Muted
     } elseif ($script:MsfsRunning) {
-        $script:BadgeStatus.Text = 'sim running'
+        $script:BadgeStatus.Text = $(if ($null -ne $script:LastFps) { '{0} FPS' -f $script:LastFps } else { 'sim running' })
         $script:BadgeStripe.BackColor = $(if ($script:ToastVisible -or $script:Slept.Count -gt 0) { $script:C.Warn } else { $script:C.Ok })
     } else {
         $script:BadgeStatus.Text = 'watching'
@@ -2287,19 +3029,28 @@ function Update-Tray {
         $script:Notify.Icon = $script:IconIdle
         $script:Notify.Text = 'MSFS Guard - paused'
     } elseif ($script:MsfsRunning) {
+        $fpsTip = ''
+        if ($null -ne $script:LastFps) {
+            $fpsTip = '{0} FPS' -f $script:LastFps
+            if ($script:LastLimit -and $script:LastLimit -ne 'None') {
+                $fpsTip = '{0}, {1}' -f $fpsTip, (Get-DevLimitLabel $script:LastLimit)
+            }
+        }
         if ($slept -gt 0 -or $script:ToastVisible) {
             $script:Notify.Icon = $script:IconWarn
-            $script:Notify.Text = "MSFS Guard - sim running, $slept slept"
+            $script:Notify.Text = $(if ($fpsTip) { "MSFS Guard - $fpsTip" } else { "MSFS Guard - sim running, $slept slept" })
         } else {
             $script:Notify.Icon = $script:IconOk
-            $script:Notify.Text = 'MSFS Guard - sim running, clean'
+            $script:Notify.Text = $(if ($fpsTip) { "MSFS Guard - $fpsTip" } else { 'MSFS Guard - sim running, clean' })
         }
     } else {
         $script:Notify.Icon = $script:IconIdle
         $script:Notify.Text = 'MSFS Guard - waiting for Flight Simulator'
     }
     try {
-        $script:MenuMsfs.Text = $(if ($script:MsfsRunning) { 'Flight Simulator: running' } else { 'Flight Simulator: not running' })
+        $script:MenuMsfs.Text = $(if ($script:MsfsRunning) {
+                if ($null -ne $script:LastFps) { 'Flight Simulator: {0} FPS' -f $script:LastFps } else { 'Flight Simulator: running' }
+            } else { 'Flight Simulator: not running' })
         $script:MenuSlept.Text = "Slept programs: $slept"
         $script:MenuPause.Text = $(if ($script:Paused) { 'Resume watching' } else { 'Pause watching' })
     } catch { }
@@ -2406,6 +3157,19 @@ function Invoke-MonitorTick {
             }
             if ($script:Session -and $script:MsfsRunning) {
                 Update-SessionSample -Msfs $msfs -MsfsCpu $msfsCpu -FreeRamMB $free -Groups $groups
+                $hw = Get-HardwareSample -MsfsPids $msfs.Pids
+                Update-HardwareSession -Hw $hw -MsfsCpu $msfsCpu -FreeRamMB $free
+                $script:LastLimit = $script:Session.LastLimit
+                if (($script:TickIndex % 2) -eq 0) {
+                    $live = Get-LiveFps
+                    if ($null -ne $live) { $script:LastFps = $live }
+                }
+                $fpsBit = if ($null -ne $script:LastFps) { '  |  {0} FPS' -f $script:LastFps } else { '' }
+                $limBit = ''
+                if ($script:LastLimit -and $script:LastLimit -ne 'None') {
+                    $limBit = '  |  {0}' -f (Get-DevLimitLabel $script:LastLimit)
+                }
+                $script:MsfsLabel = '{0}  |  {1:n0}% CPU  |  {2:n1} GB RAM{3}{4}' -f $msfs.Name, $msfsCpu, ($msfs.Ws / 1GB), $fpsBit, $limBit
             }
         }
 
@@ -2497,7 +3261,8 @@ $script:Allow = New-IgnoreSet $script:Config.UserAllowlist
 $script:DoNotSleep = New-IgnoreSet @(
     'msedgewebview2', 'XboxPcApp', 'GameBar', 'AMDRSServ',
     'Navigraph Charts', 'Couatl64_MSFS2024', '737MAX_Plugin',
-    'MSFS_AutoFPS', 'MDClient', 'CP MSFS Bridge', 'powershell', 'pwsh'
+    'MSFS_AutoFPS', 'MDClient', 'CP MSFS Bridge', 'powershell', 'pwsh',
+    'PresentMon-x64', 'PresentMon', 'MsfsFrameProbe'
 )
 $script:SafetyCache = $null
 $script:Hosted = Test-HostPresent
@@ -2533,6 +3298,20 @@ $script:LastReportMd = $null
 $script:LastReportJson = $null
 $script:LastSessionGrade = $null
 $script:LastSessionScore = 0
+$script:HwReady = $false
+$script:PresentMonExe = $null
+$script:PresentMonPid = $null
+$script:PresentMonFile = $null
+$script:PmMsCol = $null
+$script:LastGpu = $null
+$script:LastFps = $null
+$script:LastLimit = 'None'
+$script:LastSimSpeed = 1.0
+$script:FpsSource = $null
+$script:FrameProbeExe = $null
+$script:SimConnectPid = $null
+$script:SimConnectJson = $null
+$script:SimConnectCsv = $null
 $script:Badge = $null
 $script:BadgeStatus = $null
 $script:BadgeStripe = $null
@@ -2571,14 +3350,15 @@ if (-not $WriteTestReport -and $state -and $state.Slept) {
     }
 }
 
+Initialize-HardwareCounters
+Write-Log ('Started (admin={0}, cores={1}, presentmon={2})' -f (Test-IsAdmin), [Environment]::ProcessorCount, [bool]$script:PresentMonExe) 'INFO'
+
 if ($existingMsfs.Running) {
     $script:MsfsRunning = $true
     $script:MsfsLabel = '{0}  |  {1:n1} GB RAM' -f $existingMsfs.Name, ($existingMsfs.Ws / 1GB)
     New-FlightSession -MsfsName $existingMsfs.Name
     Write-Log "Joined an already-running sim session ($($existingMsfs.Name))" 'INFO'
 }
-
-Write-Log ('Started (admin={0}, cores={1})' -f (Test-IsAdmin), [Environment]::ProcessorCount) 'INFO'
 
 if ($WriteTestReport) {
     New-FlightSession -MsfsName 'FlightSimulator2024'
@@ -2596,6 +3376,28 @@ if ($WriteTestReport) {
     $script:Session.FreeRamMax = 6200
     $script:Session.NonMsfsCpuSum = 480
     $script:Session.RamAtStartMB = 2400
+    $script:Session.HwSamples = 80
+    $script:Session.GpuSum = 7280
+    $script:Session.GpuMax = 98
+    $script:Session.VramMaxMB = 14200
+    $script:Session.DiskQSum = 40
+    $script:Session.DiskQMax = 1.2
+    $script:Session.DiskMBpsMax = 22
+    $script:Session.NetMBpsSum = 40
+    $script:Session.NetMBpsMax = 3.1
+    $script:Session.SysCpuSum = 4960
+    $script:Session.SysCpuMax = 72
+    $script:Session.BnCpu = 12
+    $script:Session.BnGpu = 58
+    $script:Session.BnRam = 4
+    $script:Session.BnDisk = 2
+    $script:Session.BnNet = 0
+    $script:Session.BnNone = 4
+    $script:Session.FpsCount = 900
+    $script:Session.FpsAvg = 31.4
+    $script:Session.FpsMin = 18.2
+    $script:Session.FpsMax = 48.0
+    $script:Session.FpsAvgMs = 31.8
     $script:LastFreeRam = 4100
     Update-SessionPeak -Name 'chrome' -CpuPct 6.2 -MemMB 2100 -DiskMBps 1.2
     $script:Session.Peaks['chrome'].Samples = 80
@@ -2607,7 +3409,7 @@ if ($WriteTestReport) {
     $script:Session.Peaks['MysteryHelper'].Samples = 30
     $script:Session.Peaks['MysteryHelper'].SumCpu = 90
     Add-SessionSuggestionShown @(@{
-            Name = 'chrome'; Label = 'Google Chrome'; Reason = '6% CPU  ·  2.1 GB RAM'
+            Name = 'chrome'; Label = 'Google Chrome'; Reason = '6% CPU  |  2.1 GB RAM'
             CpuPct = 6.2; MemMB = 2100; KnownHog = $true
         })
     Add-SessionAction -Type 'sleep' -Name 'chrome' -Ok $true -Detail 'demo'

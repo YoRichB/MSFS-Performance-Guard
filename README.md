@@ -88,10 +88,14 @@ The tray balloon shows the grade (A-F). Right-click the icon → **Open last ses
 
 The report includes:
 
+- FPS from the sim itself (SimConnect **Frame** event — the official in-sim frame rate), with PresentMon as backup
+- your current sim settings from `UserCfg.opt` (Max Frame Rate, VSync, Dynamic Settings, TLOD/OLOD, clouds, traffic) so advice matches what the sim is actually set to
+- a Dev-FPS-style limiter: **Limited by MainThread**, **Limited by GPU**, Memory, Disk, or Network, plus how much of the flight each one lasted
+- CPU, GPU, VRAM, RAM, disk queue, and network rates so the card can say what actually held frames down
 - MSFS CPU / RAM and how much free RAM you had
 - which overlays appeared, and whether you Slept, Closed, Ignored, or dismissed them
 - programs that were loud but never suggested (missed hogs)
-- concrete Config.json tweaks you can make now
+- concrete next-time advice (graphics vs other programs vs streaming/disk)
 - a **If updating with Grok** task list so the next code change is based on this PC, not guesses
 
 Tell Grok: *read `GROK.md` and `Logs/GROK-DEV-BRIEFING.md`, then apply the next development tasks.*

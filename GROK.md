@@ -12,7 +12,7 @@ This folder is a live tray app. After **every Flight Simulator session** it writ
 
 The on-screen flight report card never includes this file.
 
-If those files exist, **use them**. Do not guess about nag rate, missed programs, Sleep failures, or tick cost.
+If those files exist, **use them**. Do not guess about nag rate, missed programs, Sleep failures, tick cost, FPS, or what limited the frame rate.
 
 ## What to implement
 
@@ -23,6 +23,11 @@ Do the **Next development tasks** in the briefing, highest priority first. Typic
 - make Sleep more reliable when not elevated
 - add `FocusSleepList` if the user always sleeps the same apps
 - speed up the monitor tick if session reports show slow samples
+- keep FPS / limiter wording aligned with the sim Dev FPS overlay (Limited by MainThread vs Limited by GPU)
+- prefer SimConnect Frame (MsfsFrameProbe.exe) for official sim FPS; PresentMon is backup only
+- read UserCfg.opt for FrameLimiter / VSync / TLOD / clouds / traffic so advice matches this PC
+- do not scrape MSFS process memory (AutoFPS-style offsets break on every sim update)
+- if GPU is the limiter, do not tell the user that Sleeping Chrome will raise FPS
 
 ## Rules
 
