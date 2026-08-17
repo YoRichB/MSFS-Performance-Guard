@@ -190,7 +190,8 @@ function Get-DefaultConfig {
         AutoSleepKnownHogs         = $false
         MaxSuggestions             = 5
         ShowWelcome                = $true
-        ShowCornerBadge            = $true
+        ShowCornerBadge            = $false
+        ExitAfterSession           = $true
         WriteSessionReports        = $true
         MinSessionSeconds          = 45
         BriefingKeepSessions       = 8
@@ -231,7 +232,7 @@ function Import-Config {
     $loaded = Read-JsonFile $script:ConfigPath
     $arrayKeys = New-IgnoreSet -Names @(
         'MsfsProcessNames', 'UserAllowlist', 'KnownHogs',
-        'CompanionAllowlist', 'ProtectedNames', 'FocusSleepList'
+        'CompanionAllowlist', 'ProtectedNames', 'FocusSleepList', 'DoNotSleepNames'
     )
     if ($loaded) {
         foreach ($p in $loaded.PSObject.Properties) {
@@ -455,12 +456,19 @@ function Get-IoBytes {
 }
 
 function Get-FreeRamMB {
+    if ($script:FreeRamCachedAt -and (((Get-Date) - $script:FreeRamCachedAt).TotalSeconds -lt 5)) {
+        return [int]$script:FreeRamCached
+    }
+    $mb = 0
     try {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-        return [int]([double]$os.FreePhysicalMemory / 1024.0)
+        $mb = [int]([double]$os.FreePhysicalMemory / 1024.0)
     } catch {
-        return 0
+        $mb = 0
     }
+    $script:FreeRamCached = $mb
+    $script:FreeRamCachedAt = Get-Date
+    return $mb
 }
 
 function Get-MsfsInfo {
@@ -521,6 +529,97 @@ function Compare-Snapshots {
     return @($groups.Values)
 }
 
+function Test-HostPresent {
+    try {
+        $m = [System.Threading.Mutex]::OpenExisting('Local\MSFSPerformanceGuardHost')
+        $m.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Write-RuntimeStatus {
+    try {
+        $obj = [ordered]@{
+            At          = (Get-Date).ToString('o')
+            MsfsRunning = [bool]$script:MsfsRunning
+            Admin       = [bool]$script:IsAdmin
+            Label       = [string]$script:MsfsLabel
+        }
+        ($obj | ConvertTo-Json -Compress) | Set-Content -LiteralPath (Join-Path $script:LogDir 'runtime-status.json') -Encoding UTF8
+    } catch { }
+}
+
+function Get-SafetyCache {
+    if ($script:SafetyCache) { return $script:SafetyCache }
+    $script:SafetyCache = @{}
+    $path = Join-Path $script:LogDir 'process-safety-cache.json'
+    $loaded = Read-JsonFile $path
+    if ($loaded) {
+        foreach ($p in $loaded.PSObject.Properties) {
+            $script:SafetyCache[$p.Name] = [string]$p.Value
+        }
+    }
+    return $script:SafetyCache
+}
+
+function Save-SafetyCache {
+    try {
+        $script:SafetyCache | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:LogDir 'process-safety-cache.json') -Encoding UTF8
+    } catch { }
+}
+
+function Test-NameLooksMsfsRelated {
+    param([string]$Name)
+    $n = $Name.ToLowerInvariant()
+    $keys = @(
+        'msfs', 'flightsim', 'flight sim', 'flightsimulator', 'fs2020', 'fs2024',
+        'navigraph', 'couatl', 'gsx', 'fsdt', 'pmdg', 'fenix', 'ifly', '737max',
+        'orbx', 'fsuipc', 'vpilot', 'vatsim', 'simbrief', 'littlenav', 'spad',
+        'mobiflight', 'xboxpc', 'webview', 'amdrs', 'radeon', 'nvidia', 'tobi',
+        'trackir', 'beyondatc', 'sayintentions', 'volanta', 'onair', 'chaseplane',
+        'autofps', 'mdclient', 'maddog', 'bridge'
+    )
+    foreach ($k in $keys) {
+        if ($n.Contains($k)) { return $true }
+    }
+    return $false
+}
+
+function Search-ProcessMsfsLink {
+    param([string]$Name)
+    $cache = Get-SafetyCache
+    if ($cache.ContainsKey($Name)) { return [string]$cache[$Name] }
+    $verdict = 'ok-to-suggest'
+    try {
+        $q = [uri]::EscapeDataString(('{0} MSFS OR "Flight Simulator" addon OR GSX OR Navigraph' -f $Name))
+        $resp = Invoke-WebRequest -Uri ('https://html.duckduckgo.com/html/?q={0}' -f $q) -UseBasicParsing -TimeoutSec 4
+        $html = [string]$resp.Content
+        if ($html -match 'Flight Simulator|MSFS 2024|MSFS 2020|Navigraph|GSX Pro|Couatl|add-on|addon for MSFS|Community folder') {
+            $verdict = 'msfs-related'
+        }
+    } catch {
+        $verdict = 'unknown'
+    }
+    $cache[$Name] = $verdict
+    Save-SafetyCache
+    Write-Log ("Safety check {0} -> {1}" -f $Name, $verdict) 'INFO'
+    return $verdict
+}
+
+function Test-IsSafeToSuggest {
+    param([string]$Name, [switch]$Online)
+    if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+    if ($Name -match '^(powershell|pwsh|MSFSGuard)$') { return $false }
+    if ($script:DoNotSleep -and $script:DoNotSleep.Contains($Name)) { return $false }
+    if (Test-NameLooksMsfsRelated $Name) { return $false }
+    if (-not $Online) { return $true }
+    $v = Search-ProcessMsfsLink $Name
+    if ($v -eq 'msfs-related' -or $v -eq 'unknown') { return $false }
+    return $true
+}
+
 function Test-IsOffender {
     param($Group, [int]$FreeRamMB)
     $name = $Group.Name
@@ -535,6 +634,7 @@ function Test-IsOffender {
         if (-not $script:GuardPids.Contains([int]$id)) { $allGuard = $false; break }
     }
     if ($allGuard) { return $null }
+    if (-not (Test-IsSafeToSuggest $name)) { return $null }
 
     $memMB = [int]($Group.Ws / 1MB)
     $diskMBps = $Group.IoBps / 1MB
@@ -642,6 +742,34 @@ function New-FlightSession {
     $script:Session['Suggested'] = New-Object System.Collections.Generic.List[object]
     $script:Session['Actions'] = New-Object System.Collections.Generic.List[object]
     $script:Session['SuggestedNames'] = New-IgnoreSet -Names @()
+    $script:Session['NearMisses'] = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+}
+
+function Add-NearMiss {
+    param($Group, [int]$FreeRamMB)
+    if (-not $script:Session) { return }
+    $name = $Group.Name
+    if ($script:Protected.Contains($name) -or $script:Companions.Contains($name)) { return }
+    if ($script:MsfsNames.Contains($name)) { return }
+    if ($name -match '^(powershell|pwsh|MSFSGuard)$') { return }
+    if (Test-NameLooksMsfsRelated $name) { return }
+    $memMB = [int]($Group.Ws / 1MB)
+    $cores = [Math]::Max(1, [Environment]::ProcessorCount)
+    $scale = 8.0 / $cores
+    $cpuSoft = [Math]::Max(0.6, [double]$script:Config.KnownHogSoftCpuPercent * $scale)
+    $memSoft = [double]$script:Config.KnownHogSoftMemoryMB
+    if ($Group.CpuPct -lt ($cpuSoft * 0.5) -and $memMB -lt ($memSoft * 0.5)) { return }
+    if (-not $script:Session.ContainsKey('NearMisses') -or $null -eq $script:Session.NearMisses) {
+        $script:Session['NearMisses'] = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+    }
+    $hits = $script:Session.NearMisses
+    if (-not $hits.ContainsKey($name)) {
+        $hits[$name] = @{ Name = $name; Count = 0; MaxCpu = 0.0; MaxMemMB = 0 }
+    }
+    $row = $hits[$name]
+    $row.Count++
+    if ($Group.CpuPct -gt $row.MaxCpu) { $row.MaxCpu = $Group.CpuPct }
+    if ($memMB -gt $row.MaxMemMB) { $row.MaxMemMB = $memMB }
 }
 
 function Add-SessionAction {
@@ -873,6 +1001,9 @@ function Get-SessionSuggestions {
 
     $unknown = @($Session.Peaks.Values | Where-Object {
             -not $_.KnownHog -and -not $_.Companion -and -not $_.Allow -and
+            -not (Test-NameLooksMsfsRelated $_.Name) -and
+            ($_.Name -notmatch '^(powershell|pwsh|MSFSGuard)$') -and
+            (-not $script:DoNotSleep -or -not $script:DoNotSleep.Contains($_.Name)) -and
             ($_.MaxCpu -ge $cpuSoft -or $_.MaxMemMB -ge [double]$script:Config.KnownHogSoftMemoryMB) -and
             $_.Samples -ge 8
         } | Sort-Object { $_.MaxCpu } -Descending)
@@ -1103,25 +1234,134 @@ function Build-SessionMarkdown {
         }
     }
     [void]$lines.Add('')
-    [void]$lines.Add('## Optimize next')
-    [void]$lines.Add('')
-    foreach ($idea in $Ideas) {
-        $pri = Get-ScalarText $idea.Priority
-        $ttl = Get-ScalarText $idea.Title
-        if (-not $pri) { $pri = 'info' }
-        if (-not $ttl) { $ttl = 'Optimization idea' }
-        [void]$lines.Add(('### [{0}] {1}' -f $pri.ToUpper(), $ttl))
+    $userIdeas = @(Get-UserFacingIdeas $Ideas)
+    if ($userIdeas.Count -gt 0) {
+        [void]$lines.Add('## What to do next')
         [void]$lines.Add('')
-        [void]$lines.Add((Get-ScalarText $idea.Why))
-        [void]$lines.Add('')
-        [void]$lines.Add(('**You can do now:** {0}' -f (Get-ScalarText $idea.Change)))
-        [void]$lines.Add('')
-        [void]$lines.Add(('**If updating with Grok:** {0}' -f (Get-ScalarText $idea.GrokTask)))
-        [void]$lines.Add('')
+        foreach ($idea in $userIdeas) {
+            [void]$lines.Add(('### {0}' -f (Get-ScalarText $idea.Title)))
+            [void]$lines.Add('')
+            [void]$lines.Add((Get-ScalarText $idea.Why))
+            [void]$lines.Add('')
+            [void]$lines.Add((Get-ScalarText $idea.Change))
+            [void]$lines.Add('')
+        }
     }
-    [void]$lines.Add('---')
-    [void]$lines.Add('Grok: also read `Logs/GROK-DEV-BRIEFING.md` before changing this project.')
     return ($lines -join "`r`n")
+}
+
+function Get-UserFacingIdeas {
+    param($Ideas)
+    $out = New-Object System.Collections.Generic.List[object]
+    foreach ($idea in @($Ideas)) {
+        $area = Get-ScalarText $idea.Area
+        $title = Get-ScalarText $idea.Title
+        if ($area -eq 'none' -or $area -eq 'lists') { continue }
+        if ($title -like 'Missed heavy program*') { continue }
+        [void]$out.Add($idea)
+    }
+    return , $out.ToArray()
+}
+
+function Show-UserReportCard {
+    param($Payload, $DurationText)
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'MSFS Guard - flight report'
+    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
+    $f.MaximizeBox = $false
+    $f.MinimizeBox = $false
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $f.Size = New-Object System.Drawing.Size 460, 520
+    $f.BackColor = $script:C.Bg
+    $f.ForeColor = $script:C.Text
+    $f.TopMost = $true
+    $f.ShowInTaskbar = $true
+    if ($script:IconOk) { $f.Icon = $script:IconOk }
+
+    $stripe = New-Object System.Windows.Forms.Panel
+    $stripe.BackColor = $script:C.Accent
+    $stripe.Dock = [System.Windows.Forms.DockStyle]::Left
+    $stripe.Width = 6
+    $f.Controls.Add($stripe)
+
+    $y = 16
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = 'Flight report'
+    $title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 14)
+    $title.ForeColor = $script:C.Text
+    $title.Location = New-Object System.Drawing.Point 22, $y
+    $title.AutoSize = $true
+    $f.Controls.Add($title)
+    $y += 34
+
+    $grade = New-Object System.Windows.Forms.Label
+    $grade.Text = ('Grade {0}  -  {1}' -f $Payload.Grade, $DurationText)
+    $grade.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
+    $grade.ForeColor = $script:C.Ok
+    $grade.Location = New-Object System.Drawing.Point 22, $y
+    $grade.AutoSize = $true
+    $f.Controls.Add($grade)
+    $y += 32
+
+    $slept = @($Payload.Actions | Where-Object { $_.Type -eq 'sleep' -and $_.Ok } | ForEach-Object { Get-FriendlyName $_.Name })
+    $closed = @($Payload.Actions | Where-Object { $_.Type -eq 'close' -and $_.Ok } | ForEach-Object { Get-FriendlyName $_.Name })
+    $what = New-Object System.Collections.Generic.List[string]
+    [void]$what.Add(('Simulator: {0}' -f $Payload.Sim))
+    [void]$what.Add(('MSFS CPU avg {0}% (peak {1}%)' -f $Payload.MsfsCpuAvg, $Payload.MsfsCpuMax))
+    [void]$what.Add(('MSFS RAM avg {0} GB (peak {1} GB)' -f $Payload.MsfsRamAvgGB, $Payload.MsfsRamMaxGB))
+    if ($Payload.FreeRamMinMB) {
+        [void]$what.Add(('Lowest free RAM: {0:n1} GB' -f ($Payload.FreeRamMinMB / 1024.0)))
+    }
+    if ($slept.Count -gt 0) { [void]$what.Add(('Put to sleep: {0}' -f ($slept -join ', '))) }
+    if ($closed.Count -gt 0) { [void]$what.Add(('Closed: {0}' -f ($closed -join ', '))) }
+    if ($slept.Count -eq 0 -and $closed.Count -eq 0) { [void]$what.Add('No programs were slept or closed.') }
+    [void]$what.Add('Slept programs were resumed when the sim exited.')
+
+    $body = New-Object System.Windows.Forms.Label
+    $body.Text = ($what -join [Environment]::NewLine)
+    $body.ForeColor = $script:C.Text
+    $body.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $body.Location = New-Object System.Drawing.Point 22, $y
+    $body.Size = New-Object System.Drawing.Size 400, 150
+    $f.Controls.Add($body)
+    $y += 158
+
+    $userIdeas = @(Get-UserFacingIdeas $Payload.Suggestions)
+    $next = New-Object System.Windows.Forms.Label
+    $next.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $next.ForeColor = $script:C.Muted
+    $next.Location = New-Object System.Drawing.Point 22, $y
+    $next.Size = New-Object System.Drawing.Size 400, 140
+    if ($userIdeas.Count -eq 0) {
+        $next.Text = 'Nothing else you need to do. The sim had enough RAM and the guard stayed out of the way of add-ons.'
+    } else {
+        $bits = New-Object System.Collections.Generic.List[string]
+        [void]$bits.Add('Next time:')
+        foreach ($idea in ($userIdeas | Select-Object -First 3)) {
+            [void]$bits.Add(('• {0}' -f (Get-ScalarText $idea.Change)))
+        }
+        $next.Text = ($bits -join [Environment]::NewLine)
+    }
+    $f.Controls.Add($next)
+
+    $btn = New-FlatButton 'Done' 300 440 110 32 $script:C.Ok ([System.Drawing.Color]::FromArgb(20, 28, 24))
+    $btn.Add_Click({ $f.Close() })
+    $f.Controls.Add($btn)
+    [void]$f.ShowDialog()
+}
+
+function Finish-AfterSession {
+    try {
+        if (-not (Test-Path -LiteralPath $script:LogDir)) {
+            New-Item -ItemType Directory -Path $script:LogDir -Force | Out-Null
+        }
+        Set-Content -LiteralPath (Join-Path $script:LogDir 'session-complete.flag') -Value ((Get-Date).ToString('o')) -Encoding UTF8
+    } catch { }
+    try {
+        $done = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Local\MSFSPerformanceGuard-SessionDone')
+        [void]$done.Set()
+    } catch { }
+    Close-Guard
 }
 
 function Update-GrokBriefing {
@@ -1179,6 +1419,24 @@ function Update-GrokBriefing {
     [void]$lines.Add(('Last updated: {0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date)))
     [void]$lines.Add(('Latest session: grade **{0}** ({1}/100), {2}, {3}.' -f $LatestPayload.Grade, $LatestPayload.Score, $LatestPayload.Sim, $LatestPayload.DurationText))
     [void]$lines.Add('')
+    [void]$lines.Add('This file is **developer-only**. It is never shown on the on-screen flight report card.')
+    [void]$lines.Add('')
+    [void]$lines.Add('## This session')
+    [void]$lines.Add('')
+    [void]$lines.Add(('| Field | Value |'))
+    [void]$lines.Add('| --- | --- |')
+    [void]$lines.Add(('| Outcome | {0} |' -f $LatestPayload.Outcome))
+    [void]$lines.Add(('| Admin | {0} |' -f $LatestPayload.Admin))
+    [void]$lines.Add(('| Samples | {0} (tick avg {1} ms, max {2} ms) |' -f $LatestPayload.Samples, $LatestPayload.TickMsAvg, $LatestPayload.TickMsMax))
+    [void]$lines.Add(('| MSFS CPU | avg {0}% max {1}% |' -f $LatestPayload.MsfsCpuAvg, $LatestPayload.MsfsCpuMax))
+    [void]$lines.Add(('| MSFS RAM | avg {0} GB max {1} GB |' -f $LatestPayload.MsfsRamAvgGB, $LatestPayload.MsfsRamMaxGB))
+    [void]$lines.Add(('| Other CPU | avg {0}% |' -f $LatestPayload.OtherCpuAvg))
+    [void]$lines.Add(('| Overlays / Sleep ok / Fail | {0} / {1} / {2} |' -f $LatestPayload.ToastShown, $LatestPayload.SleepOk, $LatestPayload.SleepFail))
+    [void]$lines.Add('')
+    foreach ($n in @($LatestPayload.ScoreNotes)) {
+        if ($n) { [void]$lines.Add("- $n") }
+    }
+    [void]$lines.Add('')
     [void]$lines.Add('## Next development tasks')
     [void]$lines.Add('')
     if ($ranked.Count -eq 0) {
@@ -1208,15 +1466,95 @@ function Update-GrokBriefing {
     [void]$lines.Add('## How to work this repo')
     [void]$lines.Add('')
     [void]$lines.Add('- Code: `MSFSGuard.ps1`. Config: `Config.json`.')
-    [void]$lines.Add('- After each flight: `Logs/Sessions/*.md` + `Logs/latest-session.json`.')
+    [void]$lines.Add('- After each flight: `Logs/GROK-DEV-BRIEFING.md` (this file), `Logs/latest-grok-dev.md`, `Logs/Sessions/*.grok.md`.')
     [void]$lines.Add('- Prefer the tasks above over drive-by refactors.')
     [void]$lines.Add('- Keep Sleep/Close opt-in unless the user already enabled AutoSleepKnownHogs.')
-    [void]$lines.Add('- Never suggest companions, Defender, or protected OS processes.')
-    [void]$lines.Add('- After code changes, syntax-parse MSFSGuard.ps1 and restart the tray app.')
+    [void]$lines.Add('- Never suggest companions, Defender, GPU helpers, WebView2, or protected OS processes.')
+    [void]$lines.Add('- After code changes, syntax-parse MSFSGuard.ps1, rebuild MSFSGuard.exe if the host changed, start via scheduled task.')
     [void]$lines.Add('')
     [void]$lines.Add('See `GROK.md` in the project root.')
     $path = Join-Path $script:LogDir 'GROK-DEV-BRIEFING.md'
     Set-Content -LiteralPath $path -Value ($lines -join "`r`n") -Encoding UTF8
+}
+
+function Write-GrokSessionNotes {
+    param($Payload, [string]$Stamp, [string]$Sim)
+    $dir = Join-Path $script:LogDir 'Sessions'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $safeSim = ($Sim -replace '[^\w\-]', '')
+    if (-not $safeSim) { $safeSim = 'MSFS' }
+    $lines = New-Object System.Collections.Generic.List[string]
+    [void]$lines.Add('# Grok session notes (developer only)')
+    [void]$lines.Add('')
+    [void]$lines.Add('Not shown on the user flight report card.')
+    [void]$lines.Add('')
+    [void]$lines.Add(('**{0}** - grade {1} ({2}/100) - {3} - {4}' -f $Payload.Sim, $Payload.Grade, $Payload.Score, $Payload.DurationText, $Payload.Outcome))
+    [void]$lines.Add('')
+    [void]$lines.Add('## How the session went')
+    [void]$lines.Add('')
+    [void]$lines.Add(('- Admin: {0}' -f $Payload.Admin))
+    [void]$lines.Add(('- Samples: {0}; tick avg {1} ms (max {2} ms); errors {3}' -f $Payload.Samples, $Payload.TickMsAvg, $Payload.TickMsMax, $Payload.TickErrors))
+    [void]$lines.Add(('- MSFS CPU avg {0}% peak {1}%; RAM avg {2} GB peak {3} GB' -f $Payload.MsfsCpuAvg, $Payload.MsfsCpuMax, $Payload.MsfsRamAvgGB, $Payload.MsfsRamMaxGB))
+    [void]$lines.Add(('- Other programs CPU avg {0}%' -f $Payload.OtherCpuAvg))
+    [void]$lines.Add(('- Overlays shown: {0}; Sleep ok/fail {1}/{2}; Close ok/fail {3}/{4}; Dismiss {5}' -f $Payload.ToastShown, $Payload.SleepOk, $Payload.SleepFail, $Payload.CloseOk, $Payload.CloseFail, $Payload.Dismissed))
+    [void]$lines.Add('')
+    foreach ($n in @($Payload.ScoreNotes)) {
+        if ($n) { [void]$lines.Add("- $n") }
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Actions')
+    [void]$lines.Add('')
+    $acts = @($Payload.Actions)
+    if ($acts.Count -eq 0) {
+        [void]$lines.Add('None.')
+    } else {
+        foreach ($a in $acts) {
+            [void]$lines.Add(('- {0} {1} {2} ok={3}' -f $a.At, $a.Type, $a.Name, $a.Ok))
+        }
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Loudest other programs')
+    [void]$lines.Add('')
+    foreach ($p in @($Payload.TopPrograms)) {
+        [void]$lines.Add(('- {0}: max {1}% CPU, {2} MB, samples {3}, hog={4}, companion={5}' -f $p.Label, $p.MaxCpu, $p.MaxMemMB, $p.Samples, $p.KnownHog, $p.Companion))
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Near misses (not suggested)')
+    [void]$lines.Add('')
+    $nms = @($Payload.NearMisses)
+    if ($nms.Count -eq 0) {
+        [void]$lines.Add('None recorded.')
+    } else {
+        foreach ($nm in $nms) {
+            [void]$lines.Add(('- {0}: {1} samples near bar, max {2}% CPU, {3} MB' -f $nm.Name, $nm.Count, $nm.MaxCpu, $nm.MaxMemMB))
+        }
+    }
+    [void]$lines.Add('')
+    [void]$lines.Add('## Implement next')
+    [void]$lines.Add('')
+    $any = $false
+    foreach ($idea in @($Payload.Suggestions)) {
+        $area = Get-ScalarText $idea.Area
+        if ($area -eq 'none') { continue }
+        $any = $true
+        [void]$lines.Add(('### [{0}] {1}' -f (Get-ScalarText $idea.Priority), (Get-ScalarText $idea.Title)))
+        [void]$lines.Add('')
+        [void]$lines.Add((Get-ScalarText $idea.Why))
+        [void]$lines.Add('')
+        [void]$lines.Add(('**Implement:** {0}' -f (Get-ScalarText $idea.GrokTask)))
+        [void]$lines.Add('')
+    }
+    if (-not $any) {
+        [void]$lines.Add('No development tasks this session. Do not churn defaults.')
+        [void]$lines.Add('')
+    }
+    $text = $lines -join "`r`n"
+    $path = Join-Path $dir ('{0}-{1}.grok.md' -f $Stamp, $safeSim)
+    Set-Content -LiteralPath $path -Value $text -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $script:LogDir 'latest-grok-dev.md') -Value $text -Encoding UTF8
+    Write-Log ("Grok dev notes -> {0}" -f $path) 'OK'
 }
 
 function Complete-FlightSession {
@@ -1235,6 +1573,7 @@ function Complete-FlightSession {
     try { $minSec = [double]("$($script:Config.MinSessionSeconds)") } catch { }
     if ($duration.TotalSeconds -lt $minSec -and $session.Actions.Count -eq 0 -and $session.ToastShown -eq 0) {
         Write-Log ("Session {0} skipped (only {1:n0}s, no actions)" -f $session.Id, $duration.TotalSeconds) 'INFO'
+        if (-not $WriteTestReport -and [bool]$script:Config.ExitAfterSession) { Finish-AfterSession }
         return
     }
 
@@ -1312,18 +1651,22 @@ function Complete-FlightSession {
         Add-Member -InputObject $payload -NotePropertyName Suggested -NotePropertyValue $shownCopy
         Add-Member -InputObject $payload -NotePropertyName Actions -NotePropertyValue $actionCopy
         Add-Member -InputObject $payload -NotePropertyName TopPrograms -NotePropertyValue $topPrograms.ToArray()
+        $near = @()
+        if ($session.NearMisses) {
+            $near = @($session.NearMisses.Values | Sort-Object { $_.Count } -Descending | Select-Object -First 12 | ForEach-Object {
+                    [ordered]@{ Name = $_.Name; Count = $_.Count; MaxCpu = [math]::Round($_.MaxCpu, 2); MaxMemMB = $_.MaxMemMB }
+                })
+        }
+        Add-Member -InputObject $payload -NotePropertyName NearMisses -NotePropertyValue $near
         Add-Member -InputObject $payload -NotePropertyName Markdown -NotePropertyValue $md
         $paths = Write-SessionFiles $payload $stamp $session.MsfsName
+        Write-GrokSessionNotes -Payload $payload -Stamp $stamp -Sim $session.MsfsName
         Update-GrokBriefing $payload
         Write-Log ("Session report {0} grade {1} ({2}) -> {3}" -f $session.Id, $grade, $scoreInfo.Score, $paths.Markdown) 'OK'
-        $tip = 'Session grade {0} ({1}/100). Report saved.' -f $grade, $scoreInfo.Score
-        $actionable = @($ideas | Where-Object { $_.Area -ne 'none' }).Count
-        if ($actionable -gt 0) {
-            $tip = 'Session grade {0}. {1} optimization idea(s) in the report.' -f $grade, $actionable
+        if (-not $WriteTestReport) {
+            Show-UserReportCard -Payload $payload -DurationText $durationText
+            if ([bool]$script:Config.ExitAfterSession) { Finish-AfterSession }
         }
-        try {
-            $script:Notify.ShowBalloonTip(4500, 'MSFS Performance Guard', $tip, [System.Windows.Forms.ToolTipIcon]::Info)
-        } catch { }
     } catch {
         Write-Log ("Failed to write session report: {0} :: {1}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) 'ERR'
     }
@@ -1591,7 +1934,7 @@ function Build-ToastRows {
                 $c = Invoke-SleepNamed $n
                 if ($c -le 0) {
                     [System.Windows.Forms.MessageBox]::Show(
-                        "Could not sleep $n. Try Start-Guard as administrator, or use Close.",
+                        "Could not sleep $(Get-FriendlyName $n). Windows blocked it.`r`n`r`nDouble-click Install.bat so MSFS Guard runs as administrator, then try Sleep again. Or use Close.",
                         'MSFS Performance Guard',
                         [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -1614,7 +1957,7 @@ function Build-ToastRows {
                 if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
                     if (-not (Invoke-CloseNamed $n)) {
                         [System.Windows.Forms.MessageBox]::Show(
-                            "Could not close $label. It may need administrator rights.",
+                            "Could not close $label. Windows blocked it.`r`n`r`nDouble-click Install.bat so MSFS Guard runs as administrator, then try again.",
                             'MSFS Performance Guard',
                             [System.Windows.Forms.MessageBoxButtons]::OK,
                             [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -1761,7 +2104,7 @@ function Ensure-Dashboard {
     $btnResumeOne.Add_Click({
             if ($script:DashSlept.SelectedItem) {
                 $raw = [string]$script:DashSlept.SelectedItem
-                $nm = ($raw -split '  ·  ')[0]
+                $nm = ($raw -split '  \|  ')[0]
                 # selected shows friendly name; map back to process name
                 $key = $null
                 foreach ($k in @($script:Slept.Keys)) {
@@ -1802,9 +2145,9 @@ function Rebuild-Dashboard {
     $pause = if ($script:Paused) { 'Watching is paused.' } else { 'Watching in the background.' }
     $last = ''
     if ($script:LastSessionGrade) {
-        $last = '   ·   last session {0} ({1})' -f $script:LastSessionGrade, $script:LastSessionScore
+        $last = '   |   last session {0} ({1})' -f $script:LastSessionGrade, $script:LastSessionScore
     }
-    $script:DashStatus.Text = "$msfs`r`n$ram   ·   $pause$last"
+    $script:DashStatus.Text = "$msfs`r`n$ram   |   $pause$last"
     $script:DashStripe.BackColor = if ($script:MsfsRunning) {
         if ($script:Slept.Count -gt 0 -or $script:ToastVisible) { $script:C.Warn } else { $script:C.Ok }
     } else { $script:C.Accent }
@@ -1819,7 +2162,7 @@ function Rebuild-Dashboard {
     } else {
         foreach ($k in $script:Slept.Keys) {
             $n = $script:Slept[$k].Pids.Count
-            [void]$script:DashSlept.Items.Add(('{0}  ·  {1} frozen' -f (Get-FriendlyName $k), $n))
+            [void]$script:DashSlept.Items.Add(('{0}  |  {1} frozen' -f (Get-FriendlyName $k), $n))
         }
     }
     if ($script:DashPause) {
@@ -1838,7 +2181,7 @@ function Show-Dashboard {
 function Place-Badge {
     if (-not $script:Badge) { return }
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $script:Badge.Left = $wa.Right - $script:Badge.Width - 18
+    $script:Badge.Left = $wa.Left + [int](($wa.Width - $script:Badge.Width) / 2)
     $script:Badge.Top = $wa.Bottom - $script:Badge.Height - 18
 }
 
@@ -2001,7 +2344,7 @@ function Invoke-MonitorTick {
         $script:MsfsRunning = [bool]$msfs.Running
 
         if ($script:MsfsRunning) {
-            $script:MsfsLabel = '{0}  ·  {1:n1} GB RAM' -f $msfs.Name, ($msfs.Ws / 1GB)
+            $script:MsfsLabel = '{0}  |  {1:n1} GB RAM' -f $msfs.Name, ($msfs.Ws / 1GB)
         }
 
         if ($script:MsfsRunning -and -not $wasRunning) {
@@ -2030,11 +2373,15 @@ function Invoke-MonitorTick {
         $free = Get-FreeRamMB
         $script:LastFreeRam = $free
 
-        $ioPids = New-Object System.Collections.Generic.List[int]
-        foreach ($id in $snap.Items.Keys) {
-            if ($script:DiskWatchSet.Contains($snap.Items[$id].Name)) { [void]$ioPids.Add([int]$id) }
+        $script:TickIndex++
+        $ioNow = $script:PrevIo
+        if (($script:TickIndex % 8) -eq 0) {
+            $ioPids = New-Object System.Collections.Generic.List[int]
+            foreach ($id in $snap.Items.Keys) {
+                if ($script:DiskWatchSet.Contains($snap.Items[$id].Name)) { [void]$ioPids.Add([int]$id) }
+            }
+            if ($ioPids.Count -gt 0) { $ioNow = Get-IoBytes $ioPids.ToArray() }
         }
-        $ioNow = Get-IoBytes $ioPids.ToArray()
 
         $hadPrev = [bool]$script:PrevSnap
         $groups = @()
@@ -2054,7 +2401,7 @@ function Invoke-MonitorTick {
                 $cores = [Math]::Max(1, [Environment]::ProcessorCount)
                 $msfsCpu = (($msfs.CpuSec - $script:PrevMsfsCpu) / $wall) * 100.0 / $cores
                 if ($msfsCpu -lt 0) { $msfsCpu = 0 }
-                $script:MsfsLabel = '{0}  ·  {1:n0}% CPU  ·  {2:n1} GB RAM' -f $msfs.Name, $msfsCpu, ($msfs.Ws / 1GB)
+                $script:MsfsLabel = '{0}  |  {1:n0}% CPU  |  {2:n1} GB RAM' -f $msfs.Name, $msfsCpu, ($msfs.Ws / 1GB)
             }
             if ($script:Session -and $script:MsfsRunning) {
                 Update-SessionSample -Msfs $msfs -MsfsCpu $msfsCpu -FreeRamMB $free -Groups $groups
@@ -2065,6 +2412,7 @@ function Invoke-MonitorTick {
         $script:PrevIo = $ioNow
         $script:PrevMsfsCpu = $msfs.CpuSec
 
+        Write-RuntimeStatus
         Update-Tray
         Rebuild-Dashboard
 
@@ -2084,12 +2432,15 @@ function Invoke-MonitorTick {
                 }
             } else {
                 $script:Strikes[$g.Name] = 0
+                Add-NearMiss $g $free
             }
         }
 
         if ($offenders.Count -eq 0) { return }
 
         $ranked = @($offenders | Sort-Object { $_.Score } -Descending | Select-Object -First ([int]$script:Config.MaxSuggestions))
+        $ranked = @($ranked | Where-Object { Test-IsSafeToSuggest $_.Name -Online })
+        if ($ranked.Count -eq 0) { return }
 
         if ([bool]$script:Config.AutoSleepKnownHogs) {
             foreach ($o in $ranked) {
@@ -2110,7 +2461,7 @@ function Invoke-MonitorTick {
             if ($ranked.Count -eq 0) { return }
         }
 
-        $ramBit = if ($free -gt 0) { '  ·  {0:n1} GB RAM free' -f ($free / 1024.0) } else { '' }
+        $ramBit = if ($free -gt 0) { '  |  {0:n1} GB RAM free' -f ($free / 1024.0) } else { '' }
         $header = $script:MsfsLabel + $ramBit
         Show-Toast $ranked $header
         Add-SessionSuggestionShown $ranked
@@ -2142,6 +2493,13 @@ $script:Protected = New-IgnoreSet $script:Config.ProtectedNames
 $script:Companions = New-IgnoreSet $script:Config.CompanionAllowlist
 $script:Hogs = New-IgnoreSet $script:Config.KnownHogs
 $script:Allow = New-IgnoreSet $script:Config.UserAllowlist
+$script:DoNotSleep = New-IgnoreSet @(
+    'msedgewebview2', 'XboxPcApp', 'GameBar', 'AMDRSServ',
+    'Navigraph Charts', 'Couatl64_MSFS2024', '737MAX_Plugin',
+    'MSFS_AutoFPS', 'MDClient', 'CP MSFS Bridge', 'powershell', 'pwsh'
+)
+$script:SafetyCache = $null
+$script:Hosted = Test-HostPresent
 $script:MsfsNames = New-IgnoreSet $script:Config.MsfsProcessNames
 $script:DiskWatchSet = New-IgnoreSet $script:DiskWatch
 $script:SessionIgnore = New-IgnoreSet @()
@@ -2152,6 +2510,10 @@ $script:GuardPids = New-Object 'System.Collections.Generic.HashSet[int]'
 $script:Paused = $false
 $script:Busy = $false
 $script:Exiting = $false
+$script:IsAdmin = Test-IsAdmin
+$script:TickIndex = 0
+$script:FreeRamCached = 0
+$script:FreeRamCachedAt = $null
 $script:MsfsRunning = $false
 $script:MsfsLabel = 'Flight Simulator is not running'
 $script:LastFreeRam = 0
@@ -2210,7 +2572,7 @@ if (-not $WriteTestReport -and $state -and $state.Slept) {
 
 if ($existingMsfs.Running) {
     $script:MsfsRunning = $true
-    $script:MsfsLabel = '{0}  ·  {1:n1} GB RAM' -f $existingMsfs.Name, ($existingMsfs.Ws / 1GB)
+    $script:MsfsLabel = '{0}  |  {1:n1} GB RAM' -f $existingMsfs.Name, ($existingMsfs.Ws / 1GB)
     New-FlightSession -MsfsName $existingMsfs.Name
     Write-Log "Joined an already-running sim session ($($existingMsfs.Name))" 'INFO'
 }
@@ -2363,25 +2725,27 @@ $itemExit.Add_Click({ Close-Guard })
 
 $script:Notify = New-Object System.Windows.Forms.NotifyIcon
 $script:Notify.Icon = $script:IconIdle
-$script:Notify.Text = 'MSFS Performance Guard - waiting for Flight Simulator'
-$script:Notify.Visible = $true
+$script:Notify.Text = 'MSFS Guard'
+$script:Notify.Visible = (-not $script:Hosted)
 $script:Notify.ContextMenuStrip = $script:Menu
-Show-TrayIconOnTaskbar
-if (-not $script:Config.ContainsKey('ShowCornerBadge') -or [bool]$script:Config.ShowCornerBadge) {
+if (-not $script:Hosted) {
+    Show-TrayIconOnTaskbar
+    $script:Notify.Add_MouseUp({
+            param($sender, $e)
+            if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+                if ($script:ToastVisible) { Hide-Toast; Show-Dashboard }
+                elseif ($script:LastOffenders.Count -gt 0 -and $script:MsfsRunning) {
+                    $ramBit = if ($script:LastFreeRam -gt 0) { '  |  {0:n1} GB RAM free' -f ($script:LastFreeRam / 1024.0) } else { '' }
+                    Show-Toast $script:LastOffenders ($script:MsfsLabel + $ramBit)
+                } else {
+                    Show-Dashboard
+                }
+            }
+        })
+}
+if ((-not $script:Hosted) -and (-not $script:Config.ContainsKey('ShowCornerBadge') -or [bool]$script:Config.ShowCornerBadge)) {
     Show-CornerBadge
 }
-$script:Notify.Add_MouseUp({
-        param($sender, $e)
-        if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
-            if ($script:ToastVisible) { Hide-Toast; Show-Dashboard }
-            elseif ($script:LastOffenders.Count -gt 0 -and $script:MsfsRunning) {
-                $ramBit = if ($script:LastFreeRam -gt 0) { '  ·  {0:n1} GB RAM free' -f ($script:LastFreeRam / 1024.0) } else { '' }
-                Show-Toast $script:LastOffenders ($script:MsfsLabel + $ramBit)
-            } else {
-                Show-Dashboard
-            }
-        }
-    })
 
 $intervalMs = [int]([double]$script:Config.SampleSeconds * 1000)
 if ($intervalMs -lt 1000) { $intervalMs = 1000 }
@@ -2392,7 +2756,7 @@ $script:Timer.Start()
 
 if ($Visible) { Show-Dashboard }
 
-if ((-not $script:WelcomeShown -and [bool]$script:Config.ShowWelcome) -or -not $script:IconHintShown) {
+if ((-not $script:Hosted) -and ((-not $script:WelcomeShown -and [bool]$script:Config.ShowWelcome) -or -not $script:IconHintShown)) {
     try {
         $script:Notify.ShowBalloonTip(
             5000,
@@ -2423,6 +2787,7 @@ Write-Log 'UI loop running (tray + badge)' 'OK'
 try {
     [System.Windows.Forms.Application]::Run($script:HiddenHost)
 } finally {
+    Write-Log 'UI loop ended' 'WARN'
     Close-Guard
     try { $script:Mutex.ReleaseMutex() } catch { }
 }

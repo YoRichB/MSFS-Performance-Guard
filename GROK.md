@@ -4,11 +4,13 @@ This folder is a live tray app. After **every Flight Simulator session** it writ
 
 ## Read in this order
 
-1. `Logs/GROK-DEV-BRIEFING.md` - prioritized development tasks from recent flights
-2. `Logs/latest-session.md` - last flight, human-readable
-3. `Logs/latest-session.json` - same data, structured
-4. `Logs/Sessions/` - older flights
+1. `Logs/GROK-DEV-BRIEFING.md` - rewritten after **every** flight: how it went + next-round tasks
+2. `Logs/latest-grok-dev.md` - this session only (same content as `Logs/Sessions/*.grok.md`)
+3. `Logs/latest-session.json` - structured telemetry
+4. `Logs/latest-session.md` - user-facing recap (no Grok tasks)
 5. `MSFSGuard.ps1` + `Config.json`
+
+The on-screen flight report card never includes this file.
 
 If those files exist, **use them**. Do not guess about nag rate, missed programs, Sleep failures, or tick cost.
 
