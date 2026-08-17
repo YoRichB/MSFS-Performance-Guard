@@ -192,6 +192,7 @@ function Get-DefaultConfig {
         ShowWelcome                = $true
         ShowCornerBadge            = $false
         ExitAfterSession           = $true
+        StartMode                  = 'WhenMsfsStarts'
         WriteSessionReports        = $true
         MinSessionSeconds          = 45
         BriefingKeepSessions       = 8

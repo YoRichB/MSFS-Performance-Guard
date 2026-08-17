@@ -22,13 +22,24 @@ try {
     Start-Sleep -Seconds 2
 } catch { }
 
-$task = Get-ScheduledTask -TaskName 'MSFS-Performance-Guard' -ErrorAction SilentlyContinue
-if ($task) {
-    Unregister-ScheduledTask -TaskName 'MSFS-Performance-Guard' -Confirm:$false
-    Write-Host 'Removed scheduled task: MSFS-Performance-Guard' -ForegroundColor Green
-} else {
-    Write-Host 'Task not found: MSFS-Performance-Guard' -ForegroundColor DarkGray
+foreach ($name in @(
+        'MSFS-Performance-Guard',
+        'MSFS-Guard-Logon',
+        'MSFS-Guard-Watchdog',
+        'MSFS-Guard-Listener'
+    )) {
+    $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if ($task) {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
+        Write-Host "Removed scheduled task: $name" -ForegroundColor Green
+    } else {
+        Write-Host "Task not found: $name" -ForegroundColor DarkGray
+    }
 }
+
+Get-CimInstance Win32_Process -Filter "Name='wscript.exe' OR Name='cscript.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine -like '*Listen-MSFSGuard.vbs*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 Write-Host ''
 Write-Host 'Automatic startup is stopped. The folder, logs, and Config.json were left in place.' -ForegroundColor Cyan

@@ -1,20 +1,41 @@
 #requires -Version 5.1
-# User-level keepalive: start at logon and re-check every 2 minutes.
+<#
+.SYNOPSIS
+    Registers (or removes) automatic start based on StartMode.
+.PARAMETER StartMode
+    WhenMsfsStarts - hidden listener at sign-in; Guard launches when MSFS starts.
+    Manual         - no automatic tasks; desktop shortcut only.
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('WhenMsfsStarts', 'Manual')]
+    [string]$StartMode = 'WhenMsfsStarts'
+)
+
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$exe = Join-Path $here 'MSFSGuard.exe'
+$listen = Join-Path $here 'Listen-MSFSGuard.vbs'
 $watchVbs = Join-Path $here 'Watchdog-MSFSGuard.vbs'
 $wscript = Join-Path $env:SystemRoot 'System32\wscript.exe'
-$exe = Join-Path $here 'MSFSGuard.exe'
 
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable `
-    -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+function Remove-GuardTask([string]$Name) {
+    $t = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    if ($t) {
+        Unregister-ScheduledTask -TaskName $Name -Confirm:$false
+    }
+}
 
-$logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$actionLogon = New-ScheduledTaskAction -Execute $exe -WorkingDirectory $here
+Remove-GuardTask 'MSFS-Guard-Logon'
+Remove-GuardTask 'MSFS-Guard-Watchdog'
+Remove-GuardTask 'MSFS-Guard-Listener'
+Remove-GuardTask 'MSFS-Performance-Guard'
+
+if ($StartMode -eq 'Manual') {
+    Write-Host 'Automatic start is off. Use the desktop MSFS Guard shortcut when you want it.' -ForegroundColor Cyan
+    return
+}
+
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 $prin = New-Object Security.Principal.WindowsPrincipal($id)
 $elevated = $prin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -23,11 +44,22 @@ if ($elevated) {
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
 }
 
-Register-ScheduledTask -TaskName 'MSFS-Guard-Logon' -Action $actionLogon -Trigger $logon `
-    -Principal $principal -Settings $settings `
-    -Description 'Start MSFS Performance Guard when you sign in.' -Force | Out-Null
+$settingsListen = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+$logon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$logon.Delay = 'PT15S'
+$actionListen = New-ScheduledTaskAction -Execute $wscript -Argument "//B //Nologo `"$listen`"" -WorkingDirectory $here
+
+Register-ScheduledTask -TaskName 'MSFS-Guard-Listener' -Action $actionListen -Trigger $logon `
+    -Principal $principal -Settings $settingsListen `
+    -Description 'Hidden listener: starts MSFS Guard when Flight Simulator launches.' -Force | Out-Null
 
 $tr = "`"$wscript`" //B //Nologo `"$watchVbs`""
 schtasks.exe /Create /TN 'MSFS-Guard-Watchdog' /TR $tr /SC MINUTE /MO 2 /F | Out-Null
 
-Write-Host 'Keepalive tasks registered: MSFS-Guard-Logon and MSFS-Guard-Watchdog' -ForegroundColor Green
+Write-Host 'Automatic start is on: Guard will launch when Flight Simulator starts.' -ForegroundColor Green

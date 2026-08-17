@@ -11,13 +11,16 @@ It does **not** kill or freeze anything on its own unless you turn on `AutoSleep
 
 Looks and installs the same way as **BootOptimizer**: dark overlay, scheduled task at sign-in, JSON config.
 
-## Install (start at sign-in)
+## Install
 
 1. Open `Documents\MSFS-Performance-Guard`
 2. Double-click **`Install.bat`**
-3. Approve the administrator prompt
+3. Choose how it should start:
+   - **1 — When Flight Simulator starts** (recommended). A hidden listener waits after you sign in and launches Guard by itself when MSFS 2020/2024 starts. You do not have to start Guard manually.
+   - **2 — Manual only.** Guard runs only when you double-click the **MSFS Guard** desktop shortcut.
+4. Approve the administrator prompt
 
-That creates the scheduled task `MSFS-Performance-Guard` (20 seconds after you sign in, elevated, hidden). Elevation is what lets Sleep/Close reach more programs.
+Run **Install.bat** again any time to switch between those two modes. Elevation is what lets Sleep/Close reach more programs.
 
 A **bright blue plane** sits in the system tray (dark square, cyan jet, status dot). A labeled **MSFS Guard** badge also sits at the bottom-right of the screen, and a **MSFS Guard** button appears on the taskbar. That is how you know it is running.
 
