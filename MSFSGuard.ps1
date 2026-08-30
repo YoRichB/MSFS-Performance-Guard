@@ -150,6 +150,13 @@ $script:Friendly = @{
     EXCEL                      = 'Microsoft Excel'
     POWERPNT                   = 'Microsoft PowerPoint'
     CCXProcess                 = 'Adobe Creative Cloud'
+    BackgroundDownload         = 'Background Download'
+    PPUninstaller              = 'PP Uninstaller'
+    SimFlightTab               = 'Sim Flight Tab'
+    'vatsim-radar'             = 'VATSIM Radar'
+    SteelSeriesGGClient        = 'SteelSeries GG'
+    SteelSeriesGGEZ            = 'SteelSeries GG'
+    QtWebEngineProcess         = 'Qt WebEngine'
 }
 
 $script:DiskWatch = @(
@@ -481,18 +488,22 @@ function Initialize-HardwareCounters {
         $script:PcCpu = New-Object System.Diagnostics.PerformanceCounter('Processor', '% Processor Time', '_Total')
         $script:PcDiskQ = New-Object System.Diagnostics.PerformanceCounter('PhysicalDisk', 'Avg. Disk Queue Length', '_Total')
         $script:PcDiskB = New-Object System.Diagnostics.PerformanceCounter('PhysicalDisk', 'Disk Bytes/sec', '_Total')
-        $script:PcNet = New-Object System.Collections.Generic.List[object]
+        $nets = New-Object System.Collections.Generic.List[object]
         $cat = New-Object System.Diagnostics.PerformanceCounterCategory('Network Interface')
         foreach ($inst in $cat.GetInstanceNames()) {
-            if ($inst -match 'isatap|loopback|teredo|virtual|VPN|Bluetooth') { continue }
-            [void]$script:PcNet.Add((New-Object System.Diagnostics.PerformanceCounter('Network Interface', 'Bytes Total/sec', $inst)))
+            if ($inst -match 'isatap|loopback|teredo|WAN Miniport') { continue }
+            $nc = New-Object System.Diagnostics.PerformanceCounter('Network Interface', 'Bytes Total/sec', $inst)
+            [void]$nc.NextValue()
+            [void]$nets.Add($nc)
         }
+        $script:PcNet = $nets
         [void]$script:PcCpu.NextValue()
         [void]$script:PcDiskQ.NextValue()
         [void]$script:PcDiskB.NextValue()
-        foreach ($c in $script:PcNet) { [void]$c.NextValue() }
         $script:HwReady = $true
-        Write-Log 'Hardware counters ready (CPU/GPU/disk/network)' 'OK'
+        $script:GpuFailLogged = $false
+        Write-Log ('Hardware counters ready (CPU/disk/network x{0})' -f $nets.Count) 'OK'
+        Initialize-VramCounters
     } catch {
         Write-Log ("Hardware counters failed: {0}" -f $_.Exception.Message) 'WARN'
     }
@@ -507,60 +518,154 @@ function Initialize-HardwareCounters {
     Ensure-FrameProbe
 }
 
+function Initialize-VramCounters {
+    if ($script:GpuVramCounters -and $script:GpuVramCounters.Count -gt 0) { return }
+    $script:GpuVramCounters = New-Object System.Collections.Generic.List[object]
+    try {
+        $cat = New-Object System.Diagnostics.PerformanceCounterCategory('GPU Adapter Memory')
+        foreach ($inst in $cat.GetInstanceNames()) {
+            try {
+                $pc = New-Object System.Diagnostics.PerformanceCounter('GPU Adapter Memory', 'Dedicated Usage', $inst, $true)
+                [void]$pc.NextValue()
+                [void]$script:GpuVramCounters.Add($pc)
+            } catch { }
+        }
+    } catch { }
+}
+
+function Sync-GpuCounters {
+    param($MsfsPids)
+    $want = New-Object System.Collections.Generic.List[int]
+    foreach ($pid in @($MsfsPids)) {
+        try { [void]$want.Add([int]$pid) } catch { }
+    }
+    $key = (($want | Sort-Object) -join ',')
+    $fresh = $false
+    if ($script:GpuSyncKey -ne $key) { $fresh = $true }
+    if (-not $script:GpuEngineCounters -or $script:GpuEngineCounters.Count -eq 0) { $fresh = $true }
+    if (($script:TickIndex % 20) -eq 2) { $fresh = $true }
+    if (-not $fresh) { return }
+    $script:GpuSyncKey = $key
+    if ($script:GpuEngineCounters) {
+        foreach ($item in $script:GpuEngineCounters) {
+            try { $item.Counter.Dispose() } catch { }
+        }
+    }
+    $script:GpuEngineCounters = New-Object System.Collections.Generic.List[object]
+    if ($want.Count -eq 0) { return }
+    try {
+        $cat = New-Object System.Diagnostics.PerformanceCounterCategory('GPU Engine')
+        $set = New-Object 'System.Collections.Generic.HashSet[int]'
+        foreach ($w in $want) { [void]$set.Add([int]$w) }
+        foreach ($inst in $cat.GetInstanceNames()) {
+            if ($inst -notmatch 'engtype_3d|engtype_graphics|engtype_compute') { continue }
+            $pid = 0
+            if ($inst -match 'pid_(\d+)_') { $pid = [int]$Matches[1] } else { continue }
+            if (-not $set.Contains($pid)) { continue }
+            try {
+                $pc = New-Object System.Diagnostics.PerformanceCounter('GPU Engine', 'Utilization Percentage', $inst, $true)
+                [void]$pc.NextValue()
+                [void]$script:GpuEngineCounters.Add(@{ Pid = $pid; Counter = $pc })
+            } catch { }
+        }
+        if ($script:GpuEngineCounters.Count -eq 0 -and -not $script:GpuFailLogged) {
+            Write-Log ('GPU engine: no 3D/compute instances for pid(s) {0} yet' -f $key) 'INFO'
+        }
+    } catch {
+        if (-not $script:GpuFailLogged) {
+            $script:GpuFailLogged = $true
+            Write-Log ("GPU Engine category: {0}" -f $_.Exception.Message) 'WARN'
+        }
+    }
+}
+
 function Get-GpuSample {
-    param([int[]]$MsfsPids)
+    param($MsfsPids)
+    $row = [pscustomobject]@{ Gpu = 0.0; MsfsGpu = 0.0; VramMB = 0 }
     $gpu = 0.0
     $msfsGpu = 0.0
-    $vramMB = 0
-    try {
-        $samples = (Get-Counter '\GPU Engine(*engtype_3D)\Utilization Percentage' -ErrorAction Stop).CounterSamples
-        foreach ($s in $samples) {
-            $v = [double]$s.CookedValue
+    if ($script:GpuEngineCounters) {
+        foreach ($item in $script:GpuEngineCounters) {
+            $v = 0.0
+            try { $v = [double]$item.Counter.NextValue() } catch { continue }
+            if ($v -le 0) { continue }
             if ($v -gt $gpu) { $gpu = $v }
-            foreach ($pid in @($MsfsPids)) {
-                if ($s.InstanceName -like "pid_${pid}_*") { $msfsGpu += $v }
-            }
+            $msfsGpu += $v
         }
-        if ($msfsGpu -gt 100) { $msfsGpu = 100 }
-        if ($msfsGpu -gt $gpu) { $gpu = $msfsGpu }
-    } catch { }
+    }
+    if ($msfsGpu -gt 100) { $msfsGpu = 100 }
+    if ($msfsGpu -gt $gpu) { $gpu = $msfsGpu }
+    $vramMB = 0
+    if ($script:GpuVramCounters) {
+        $max = 0.0
+        foreach ($pc in $script:GpuVramCounters) {
+            try {
+                $v = [double]$pc.NextValue()
+                if ($v -gt $max) { $max = $v }
+            } catch { }
+        }
+        if ($max -gt 0) { $vramMB = [int]($max / 1MB) }
+    }
+    $row.Gpu = [math]::Round($gpu, 1)
+    $row.MsfsGpu = [math]::Round($msfsGpu, 1)
+    $row.VramMB = $vramMB
+    return $row
+}
+
+function Get-NetMBps {
+    $sum = 0.0
+    if ($script:PcNet) {
+        foreach ($c in $script:PcNet) {
+            try { $sum += [double]$c.NextValue() } catch { }
+        }
+    }
+    if ($sum -gt 0) { return [math]::Round($sum / 1MB, 3) }
     try {
-        $vs = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage' -ErrorAction Stop).CounterSamples
-        $max = ($vs | Measure-Object -Property CookedValue -Maximum).Maximum
-        $vramMB = [int]($max / 1MB)
+        $rows = Get-CimInstance -ClassName Win32_PerfFormattedData_Tcpip_NetworkInterface -ErrorAction Stop
+        foreach ($r in $rows) {
+            if ($r.Name -match 'isatap|loopback|teredo|WAN Miniport') { continue }
+            try { $sum += [double]$r.BytesTotalPersec } catch { }
+        }
     } catch { }
-    return @{ Gpu = $gpu; MsfsGpu = $msfsGpu; VramMB = $vramMB }
+    return [math]::Round($sum / 1MB, 3)
 }
 
 function Get-HardwareSample {
-    param([int[]]$MsfsPids)
+    param($MsfsPids)
     $cpu = 0.0
     $diskQ = 0.0
     $diskMBps = 0.0
     $netMBps = 0.0
+    $gpuVal = 0.0
+    $msfsGpu = 0.0
+    $vramMB = 0
     if ($script:HwReady) {
         try { $cpu = [double]$script:PcCpu.NextValue() } catch { }
         try { $diskQ = [double]$script:PcDiskQ.NextValue() } catch { }
         try { $diskMBps = [double]$script:PcDiskB.NextValue() / 1MB } catch { }
-        foreach ($c in @($script:PcNet)) {
-            try { $netMBps += [double]$c.NextValue() / 1MB } catch { }
-        }
+        try { $netMBps = Get-NetMBps } catch { }
     }
-    $gpu = @{ Gpu = 0.0; MsfsGpu = 0.0; VramMB = 0 }
+    $gpu = $null
     if (($script:TickIndex % 2) -eq 0) {
-        $gpu = Get-GpuSample $MsfsPids
-        $script:LastGpu = $gpu
+        try { Sync-GpuCounters $MsfsPids } catch { }
+        try { $gpu = Get-GpuSample $MsfsPids } catch { }
+        if ($gpu) { $script:LastGpu = $gpu }
     } elseif ($script:LastGpu) {
         $gpu = $script:LastGpu
     }
-    return @{
-        SysCpu   = $cpu
-        DiskQ    = $diskQ
-        DiskMBps = $diskMBps
-        NetMBps  = $netMBps
-        Gpu      = [double]$gpu.Gpu
-        MsfsGpu  = [double]$gpu.MsfsGpu
-        VramMB   = [int]$gpu.VramMB
+    if ($gpu) {
+        try { $gpuVal = [double]$gpu.Gpu } catch { }
+        try { $msfsGpu = [double]$gpu.MsfsGpu } catch { }
+        try { $vramMB = [int]$gpu.VramMB } catch { }
+    }
+    [pscustomobject]@{
+        SysCpu   = [double]$cpu
+        DiskQ    = [double]$diskQ
+        DiskMBps = [double]$diskMBps
+        NetMBps  = [double]$netMBps
+        Gpu      = [double]$gpuVal
+        MsfsGpu  = [double]$msfsGpu
+        VramMB   = [int]$vramMB
     }
 }
 
@@ -574,12 +679,14 @@ function Get-BottleneckName {
         try { $cap = [int]$script:Session.FrameLimiter } catch { }
     }
     $fps = 0.0
-    if ($null -ne $script:LastFps) { $fps = [double]$script:LastFps }
-    if ($cap -ge 15 -and $cap -le 90 -and $fps -ge ($cap * 0.92)) {
-        $gpuCap = [math]::Max($Hw.Gpu, $Hw.MsfsGpu)
-        if ($gpuCap -lt 85 -and $MsfsCpu -lt 20 -and $Hw.DiskQ -lt 2) { return 'Cap' }
+    if ($null -ne $script:LastFps) { try { $fps = [double]$script:LastFps } catch { } }
+    $gpu = 0.0
+    try { $gpu = [math]::Max([double]$Hw.Gpu, [double]$Hw.MsfsGpu) } catch {
+        try { $gpu = [double]$Hw.Gpu } catch { }
     }
-    $gpu = [math]::Max($Hw.Gpu, $Hw.MsfsGpu)
+    if ($cap -ge 15 -and $cap -le 90 -and $fps -ge ($cap * 0.92)) {
+        if ($gpu -lt 85 -and $MsfsCpu -lt 20 -and [double]$Hw.DiskQ -lt 2) { return 'Cap' }
+    }
     if ($gpu -ge 88 -and $MsfsCpu -lt 22) { return 'GPU' }
     if ($MsfsCpu -ge 14 -or $Hw.SysCpu -ge 82) { return 'CPU' }
     if ($gpu -ge 78) { return 'GPU' }
@@ -799,17 +906,28 @@ function Update-HardwareSession {
         $s['BnCpu'] = 0; $s['BnGpu'] = 0; $s['BnRam'] = 0; $s['BnDisk'] = 0; $s['BnNet'] = 0; $s['BnCap'] = 0; $s['BnNone'] = 0
         $s['LastLimit'] = 'None'
     }
+    $gpu = 0.0; $msfsGpu = 0.0; $vram = 0
+    $diskQ = 0.0; $diskMB = 0.0; $netMB = 0.0; $sysCpu = 0.0
+    try { $gpu = [double]$Hw.Gpu } catch { }
+    try { $msfsGpu = [double]$Hw.MsfsGpu } catch { }
+    try { $vram = [int]$Hw.VramMB } catch { }
+    try { $diskQ = [double]$Hw.DiskQ } catch { }
+    try { $diskMB = [double]$Hw.DiskMBps } catch { }
+    try { $netMB = [double]$Hw.NetMBps } catch { }
+    try { $sysCpu = [double]$Hw.SysCpu } catch { }
+    if ($msfsGpu -gt $gpu) { $gpu = $msfsGpu }
     $s.HwSamples++
-    $s.GpuSum += $Hw.Gpu
-    if ($Hw.Gpu -gt $s.GpuMax) { $s.GpuMax = $Hw.Gpu }
-    if ($Hw.VramMB -gt $s.VramMaxMB) { $s.VramMaxMB = $Hw.VramMB }
-    $s.DiskQSum += $Hw.DiskQ
-    if ($Hw.DiskQ -gt $s.DiskQMax) { $s.DiskQMax = $Hw.DiskQ }
-    if ($Hw.DiskMBps -gt $s.DiskMBpsMax) { $s.DiskMBpsMax = $Hw.DiskMBps }
-    $s.NetMBpsSum += $Hw.NetMBps
-    if ($Hw.NetMBps -gt $s.NetMBpsMax) { $s.NetMBpsMax = $Hw.NetMBps }
-    $s.SysCpuSum += $Hw.SysCpu
-    if ($Hw.SysCpu -gt $s.SysCpuMax) { $s.SysCpuMax = $Hw.SysCpu }
+    $s.GpuSum += $gpu
+    if ($gpu -gt $s.GpuMax) { $s.GpuMax = $gpu }
+    if ($vram -gt $s.VramMaxMB) { $s.VramMaxMB = $vram }
+    $s.DiskQSum += $diskQ
+    if ($diskQ -gt $s.DiskQMax) { $s.DiskQMax = $diskQ }
+    if ($diskMB -gt $s.DiskMBpsMax) { $s.DiskMBpsMax = $diskMB }
+    $s.NetMBpsSum += $netMB
+    if ($netMB -gt $s.NetMBpsMax) { $s.NetMBpsMax = $netMB }
+    $s.SysCpuSum += $sysCpu
+    if ($sysCpu -gt $s.SysCpuMax) { $s.SysCpuMax = $sysCpu }
+    $Hw = @{ Gpu = $gpu; MsfsGpu = $msfsGpu; VramMB = $vram; DiskQ = $diskQ; DiskMBps = $diskMB; NetMBps = $netMB; SysCpu = $sysCpu }
     $bn = Get-BottleneckName -Hw $Hw -MsfsCpu $MsfsCpu -FreeRamMB $FreeRamMB
     $s.LastLimit = $bn
     switch ($bn) {
@@ -1093,7 +1211,8 @@ function Test-NameLooksMsfsRelated {
         'orbx', 'fsuipc', 'vpilot', 'vatsim', 'simbrief', 'littlenav', 'spad',
         'mobiflight', 'xboxpc', 'webview', 'amdrs', 'radeon', 'nvidia', 'tobi',
         'trackir', 'beyondatc', 'sayintentions', 'volanta', 'onair', 'chaseplane',
-        'autofps', 'mdclient', 'maddog', 'bridge', 'presentmon'
+        'autofps', 'mdclient', 'maddog', 'bridge', 'presentmon',
+        'simflight', 'vatsim-radar'
     )
     foreach ($k in $keys) {
         if ($n.Contains($k)) { return $true }
@@ -1103,23 +1222,12 @@ function Test-NameLooksMsfsRelated {
 
 function Search-ProcessMsfsLink {
     param([string]$Name)
+    # Kept for optional offline cache use. Do not call on the overlay hot path:
+    # searching "X Flight Simulator addon" matches almost every page, which
+    # previously marked Chrome/Opera/Discord as sim-related and hid every toast.
     $cache = Get-SafetyCache
     if ($cache.ContainsKey($Name)) { return [string]$cache[$Name] }
-    $verdict = 'ok-to-suggest'
-    try {
-        $q = [uri]::EscapeDataString(('{0} MSFS OR "Flight Simulator" addon OR GSX OR Navigraph' -f $Name))
-        $resp = Invoke-WebRequest -Uri ('https://html.duckduckgo.com/html/?q={0}' -f $q) -UseBasicParsing -TimeoutSec 4
-        $html = [string]$resp.Content
-        if ($html -match 'Flight Simulator|MSFS 2024|MSFS 2020|Navigraph|GSX Pro|Couatl|add-on|addon for MSFS|Community folder') {
-            $verdict = 'msfs-related'
-        }
-    } catch {
-        $verdict = 'unknown'
-    }
-    $cache[$Name] = $verdict
-    Save-SafetyCache
-    Write-Log ("Safety check {0} -> {1}" -f $Name, $verdict) 'INFO'
-    return $verdict
+    return 'ok-to-suggest'
 }
 
 function Test-IsSafeToSuggest {
@@ -1128,9 +1236,11 @@ function Test-IsSafeToSuggest {
     if ($Name -match '^(powershell|pwsh|MSFSGuard)$') { return $false }
     if ($script:DoNotSleep -and $script:DoNotSleep.Contains($Name)) { return $false }
     if (Test-NameLooksMsfsRelated $Name) { return $false }
-    if (-not $Online) { return $true }
-    $v = Search-ProcessMsfsLink $Name
-    if ($v -eq 'msfs-related' -or $v -eq 'unknown') { return $false }
+    if ($script:Hogs -and $script:Hogs.Contains($Name)) { return $true }
+    if ($Online) {
+        $v = Search-ProcessMsfsLink $Name
+        if ($v -eq 'msfs-related') { return $false }
+    }
     return $true
 }
 
@@ -2736,10 +2846,46 @@ function Build-ToastRows {
     $script:ToastFooter.Top = 118 + $y
 }
 
+function Show-CompanionInfo {
+    param($Groups)
+    if (-not $script:Notify -or $script:Exiting) { return }
+    if (-not $script:CompanionWarned) {
+        $script:CompanionWarned = New-IgnoreSet @()
+    }
+    $cores = [Math]::Max(1, [Environment]::ProcessorCount)
+    $scale = 8.0 / $cores
+    $bar = [Math]::Max(4.0, [double]$script:Config.CpuPercentThreshold * $scale * 2.0)
+    foreach ($g in @($Groups)) {
+        if (-not $script:Companions.Contains($g.Name)) { continue }
+        if ($script:CompanionWarned.Contains($g.Name)) { continue }
+        $memMB = [int]($g.Ws / 1MB)
+        if ($g.CpuPct -lt $bar -and $memMB -lt 1500) { continue }
+        [void]$script:CompanionWarned.Add($g.Name)
+        $label = Get-FriendlyName $g.Name
+        Write-Log ("Companion {0} is expensive ({1:n1}% CPU, {2} MB) - informing only" -f $g.Name, $g.CpuPct, $memMB) 'INFO'
+        try {
+            $script:Notify.ShowBalloonTip(
+                5000,
+                'Sim add-on is busy',
+                ('{0} is using {1:n0}% CPU / {2:n1} GB. Left running because it is a Flight Simulator add-on.' -f $label, $g.CpuPct, ($memMB / 1024.0)),
+                [System.Windows.Forms.ToolTipIcon]::Info
+            )
+        } catch { }
+        return
+    }
+}
+
 function Show-Toast {
     param($Offenders, [string]$Header)
     if (-not $Offenders -or $Offenders.Count -eq 0) { return }
     $script:LastOffenders = @($Offenders)
+    if ($script:ToastTitle) {
+        if ($script:LastLimit -eq 'CPU') {
+            $script:ToastTitle.Text = 'Limited by MainThread'
+        } else {
+            $script:ToastTitle.Text = 'MSFS Performance Guard'
+        }
+    }
     $script:ToastSub.Text = $Header
     Build-ToastRows $Offenders
     $script:ToastStripe.BackColor = $script:C.Warn
@@ -3023,33 +3169,39 @@ function Show-CornerBadge {
 }
 
 function Update-Tray {
+    if ($script:Exiting) { return }
     if (-not $script:Notify) { return }
     $slept = $script:Slept.Count
+    $icon = $script:IconIdle
+    $tip = 'MSFS Guard - waiting for Flight Simulator'
     if ($script:Paused) {
-        $script:Notify.Icon = $script:IconIdle
-        $script:Notify.Text = 'MSFS Guard - paused'
+        $icon = $script:IconIdle
+        $tip = 'MSFS Guard - paused'
     } elseif ($script:MsfsRunning) {
         $fpsTip = ''
         if ($null -ne $script:LastFps) {
-            $fpsTip = '{0} FPS' -f $script:LastFps
+            $fpsTip = '{0} FPS' -f [double]$script:LastFps
             if ($script:LastLimit -and $script:LastLimit -ne 'None') {
-                $fpsTip = '{0}, {1}' -f $fpsTip, (Get-DevLimitLabel $script:LastLimit)
+                $fpsTip = '{0}, {1}' -f $fpsTip, [string](Get-DevLimitLabel $script:LastLimit)
             }
         }
         if ($slept -gt 0 -or $script:ToastVisible) {
-            $script:Notify.Icon = $script:IconWarn
-            $script:Notify.Text = $(if ($fpsTip) { "MSFS Guard - $fpsTip" } else { "MSFS Guard - sim running, $slept slept" })
+            $icon = $script:IconWarn
+            $tip = $(if ($fpsTip) { "MSFS Guard - $fpsTip" } else { "MSFS Guard - sim running, $slept slept" })
         } else {
-            $script:Notify.Icon = $script:IconOk
-            $script:Notify.Text = $(if ($fpsTip) { "MSFS Guard - $fpsTip" } else { 'MSFS Guard - sim running, clean' })
+            $icon = $script:IconOk
+            $tip = $(if ($fpsTip) { "MSFS Guard - $fpsTip" } else { 'MSFS Guard - sim running, clean' })
         }
-    } else {
-        $script:Notify.Icon = $script:IconIdle
-        $script:Notify.Text = 'MSFS Guard - waiting for Flight Simulator'
+    }
+    try {
+        if ($icon) { $script:Notify.Icon = $icon }
+        $script:Notify.Text = $tip
+    } catch {
+        return
     }
     try {
         $script:MenuMsfs.Text = $(if ($script:MsfsRunning) {
-                if ($null -ne $script:LastFps) { 'Flight Simulator: {0} FPS' -f $script:LastFps } else { 'Flight Simulator: running' }
+                if ($null -ne $script:LastFps) { 'Flight Simulator: {0} FPS' -f [double]$script:LastFps } else { 'Flight Simulator: running' }
             } else { 'Flight Simulator: not running' })
         $script:MenuSlept.Text = "Slept programs: $slept"
         $script:MenuPause.Text = $(if ($script:Paused) { 'Resume watching' } else { 'Pause watching' })
@@ -3069,7 +3221,13 @@ function Close-Guard {
         }
     } catch { }
     try { [void](Invoke-ResumeAll) } catch { }
-    try { if ($script:Notify) { $script:Notify.Visible = $false; $script:Notify.Dispose() } } catch { }
+    try {
+        if ($script:Notify) {
+            $script:Notify.Visible = $false
+            $script:Notify.Dispose()
+        }
+    } catch { }
+    $script:Notify = $null
     try { [System.Windows.Forms.Application]::Exit() } catch { }
 }
 
@@ -3077,6 +3235,7 @@ function Close-Guard {
 # Monitor tick
 # -----------------------------------------------------------------------------
 function Invoke-MonitorTick {
+    if ($script:Exiting) { return }
     if ($script:Busy) { return }
     $script:Busy = $true
     $tickWatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -3103,6 +3262,7 @@ function Invoke-MonitorTick {
             Write-Log "Flight Simulator detected ($($msfs.Name))" 'OK'
             $script:SessionIgnore = New-IgnoreSet @()
             $script:Strikes = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+            $script:CompanionWarned = New-IgnoreSet @()
             $script:CooldownUntil = [datetime]::MinValue
             if ($script:Session) { Complete-FlightSession -Outcome 'interrupted' }
             New-FlightSession -MsfsName $msfs.Name
@@ -3115,11 +3275,13 @@ function Invoke-MonitorTick {
             Write-Log 'Flight Simulator exited' 'INFO'
             Hide-Toast
             Complete-FlightSession -Outcome 'completed'
+            if ($script:Exiting) { return }
             if ($script:Config.AutoResumeWhenMsfsExits -and $script:Slept.Count -gt 0) {
                 [void](Invoke-ResumeAll)
             }
             $script:SessionIgnore = New-IgnoreSet @()
             $script:Strikes = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+            $script:CompanionWarned = New-IgnoreSet @()
         }
 
         $free = Get-FreeRamMB
@@ -3157,19 +3319,26 @@ function Invoke-MonitorTick {
             }
             if ($script:Session -and $script:MsfsRunning) {
                 Update-SessionSample -Msfs $msfs -MsfsCpu $msfsCpu -FreeRamMB $free -Groups $groups
-                $hw = Get-HardwareSample -MsfsPids $msfs.Pids
-                Update-HardwareSession -Hw $hw -MsfsCpu $msfsCpu -FreeRamMB $free
-                $script:LastLimit = $script:Session.LastLimit
-                if (($script:TickIndex % 2) -eq 0) {
-                    $live = Get-LiveFps
-                    if ($null -ne $live) { $script:LastFps = $live }
+                try {
+                    $pids = @()
+                    foreach ($id in @($msfs.Pids)) { try { $pids += [int]$id } catch { } }
+                    $hw = Get-HardwareSample -MsfsPids $pids
+                    Update-HardwareSession -Hw $hw -MsfsCpu ([double]$msfsCpu) -FreeRamMB ([int]$free)
+                    $script:LastLimit = [string]$script:Session.LastLimit
+                    if (($script:TickIndex % 2) -eq 0) {
+                        $live = Get-LiveFps
+                        if ($null -ne $live) { $script:LastFps = [double]$live }
+                    }
+                    $fpsBit = ''
+                    if ($null -ne $script:LastFps) { $fpsBit = '  |  {0} FPS' -f [double]$script:LastFps }
+                    $limBit = ''
+                    if ($script:LastLimit -and $script:LastLimit -ne 'None') {
+                        $limBit = '  |  {0}' -f [string](Get-DevLimitLabel $script:LastLimit)
+                    }
+                    $script:MsfsLabel = '{0}  |  {1:n0}% CPU  |  {2:n1} GB RAM{3}{4}' -f [string]$msfs.Name, [double]$msfsCpu, [double]($msfs.Ws / 1GB), [string]$fpsBit, [string]$limBit
+                } catch {
+                    Write-Log ("Hardware sample failed: {0} :: {1}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) 'WARN'
                 }
-                $fpsBit = if ($null -ne $script:LastFps) { '  |  {0} FPS' -f $script:LastFps } else { '' }
-                $limBit = ''
-                if ($script:LastLimit -and $script:LastLimit -ne 'None') {
-                    $limBit = '  |  {0}' -f (Get-DevLimitLabel $script:LastLimit)
-                }
-                $script:MsfsLabel = '{0}  |  {1:n0}% CPU  |  {2:n1} GB RAM{3}{4}' -f $msfs.Name, $msfsCpu, ($msfs.Ws / 1GB), $fpsBit, $limBit
             }
         }
 
@@ -3178,6 +3347,7 @@ function Invoke-MonitorTick {
         $script:PrevMsfsCpu = $msfs.CpuSec
 
         Write-RuntimeStatus
+        if ($script:Exiting) { return }
         Update-Tray
         Rebuild-Dashboard
 
@@ -3201,11 +3371,22 @@ function Invoke-MonitorTick {
             }
         }
 
-        if ($offenders.Count -eq 0) { return }
+        if ($offenders.Count -eq 0) {
+            Show-CompanionInfo $groups
+            return
+        }
 
-        $ranked = @($offenders | Sort-Object { $_.Score } -Descending | Select-Object -First ([int]$script:Config.MaxSuggestions))
-        $ranked = @($ranked | Where-Object { Test-IsSafeToSuggest $_.Name -Online })
-        if ($ranked.Count -eq 0) { return }
+        $cpuBound = ($script:LastLimit -eq 'CPU')
+        if ($cpuBound) {
+            $ranked = @($offenders | Sort-Object CpuPct -Descending | Select-Object -First ([int]$script:Config.MaxSuggestions))
+        } else {
+            $ranked = @($offenders | Sort-Object Score -Descending | Select-Object -First ([int]$script:Config.MaxSuggestions))
+        }
+        $ranked = @($ranked | Where-Object { Test-IsSafeToSuggest $_.Name })
+        if ($ranked.Count -eq 0) {
+            Write-Log ('Held back {0} offender(s) (companion/protected/MSFS-related)' -f $offenders.Count) 'INFO'
+            return
+        }
 
         if ([bool]$script:Config.AutoSleepKnownHogs) {
             foreach ($o in $ranked) {
@@ -3230,8 +3411,9 @@ function Invoke-MonitorTick {
         $header = $script:MsfsLabel + $ramBit
         Show-Toast $ranked $header
         Add-SessionSuggestionShown $ranked
+        Write-Log ('Overlay: {0} ({1})' -f $ranked[0].Label, $ranked[0].Reason) 'INFO'
     } catch {
-        Write-Log "Monitor tick failed: $($_.Exception.Message)" 'ERR'
+        Write-Log ("Monitor tick failed: {0} :: {1}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) 'ERR'
         if ($script:Session) { $script:Session.TickErrors++ }
     } finally {
         try {
@@ -3262,7 +3444,8 @@ $script:DoNotSleep = New-IgnoreSet @(
     'msedgewebview2', 'XboxPcApp', 'GameBar', 'AMDRSServ',
     'Navigraph Charts', 'Couatl64_MSFS2024', '737MAX_Plugin',
     'MSFS_AutoFPS', 'MDClient', 'CP MSFS Bridge', 'powershell', 'pwsh',
-    'PresentMon-x64', 'PresentMon', 'MsfsFrameProbe'
+    'PresentMon-x64', 'PresentMon', 'MsfsFrameProbe',
+    'QtWebEngineProcess', 'QmlRenderer'
 )
 $script:SafetyCache = $null
 $script:Hosted = Test-HostPresent
@@ -3304,6 +3487,12 @@ $script:PresentMonPid = $null
 $script:PresentMonFile = $null
 $script:PmMsCol = $null
 $script:LastGpu = $null
+$script:GpuFailLogged = $false
+$script:GpuEngineCounters = $null
+$script:GpuVramCounters = $null
+$script:GpuSyncKey = ''
+$script:CompanionWarned = New-IgnoreSet @()
+$script:PcNet = $null
 $script:LastFps = $null
 $script:LastLimit = 'None'
 $script:LastSimSpeed = 1.0
@@ -3447,6 +3636,7 @@ $toastTitle.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10.5)
 $toastTitle.Location = New-Object System.Drawing.Point 18, 12
 $toastTitle.AutoSize = $true
 $script:Toast.Controls.Add($toastTitle)
+$script:ToastTitle = $toastTitle
 
 $script:ToastSub = New-Object System.Windows.Forms.Label
 $script:ToastSub.ForeColor = $script:C.Muted

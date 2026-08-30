@@ -1,7 +1,7 @@
 ' Hidden listener. Started at sign-in when the user chose "start with MSFS".
 ' No console window. Starts MSFSGuard.exe --silent only when the sim is running.
 Option Explicit
-Dim fso, sh, svc, dir, exe, logs, q, p, n, mine
+Dim fso, sh, svc, dir, exe, logs, q, p, n, mine, tf, myPid
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
@@ -13,13 +13,25 @@ If Not fso.FolderExists(logs) Then fso.CreateFolder logs
 
 ' Only one listener.
 mine = 0
-Set q = svc.ExecQuery("Select CommandLine from Win32_Process Where Name='wscript.exe' OR Name='cscript.exe'")
+myPid = 0
+Set q = svc.ExecQuery("Select ProcessId, CommandLine from Win32_Process Where Name='wscript.exe' OR Name='cscript.exe'")
 For Each p In q
   If Not IsNull(p.CommandLine) Then
-    If InStr(LCase(p.CommandLine), "listen-msfsguard.vbs") > 0 Then mine = mine + 1
+    If InStr(LCase(p.CommandLine), "listen-msfsguard.vbs") > 0 Then
+      mine = mine + 1
+      myPid = p.ProcessId
+    End If
   End If
 Next
 If mine > 1 Then WScript.Quit 0
+
+If myPid > 0 Then
+  On Error Resume Next
+  Set tf = fso.CreateTextFile(logs & "\listener.pid", True)
+  tf.Write CStr(myPid)
+  tf.Close
+  On Error GoTo 0
+End If
 
 Do
   On Error Resume Next

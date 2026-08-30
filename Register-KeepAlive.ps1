@@ -59,7 +59,18 @@ Register-ScheduledTask -TaskName 'MSFS-Guard-Listener' -Action $actionListen -Tr
     -Principal $principal -Settings $settingsListen `
     -Description 'Hidden listener: starts MSFS Guard when Flight Simulator launches.' -Force | Out-Null
 
-$tr = "`"$wscript`" //B //Nologo `"$watchVbs`""
-schtasks.exe /Create /TN 'MSFS-Guard-Watchdog' /TR $tr /SC MINUTE /MO 2 /F | Out-Null
+$settingsWatch = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
+$actionWatch = New-ScheduledTaskAction -Execute $wscript -Argument "//B //Nologo `"$watchVbs`"" -WorkingDirectory $here
+$watchTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
+    -RepetitionInterval (New-TimeSpan -Minutes 2) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
+Register-ScheduledTask -TaskName 'MSFS-Guard-Watchdog' -Action $actionWatch -Trigger $watchTrigger `
+    -Principal $principal -Settings $settingsWatch `
+    -Description 'If the MSFS Guard listener dies, start the elevated listener task again. Does not launch Guard itself.' -Force | Out-Null
 
 Write-Host 'Automatic start is on: Guard will launch when Flight Simulator starts.' -ForegroundColor Green
