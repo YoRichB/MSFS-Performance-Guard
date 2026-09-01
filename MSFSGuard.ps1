@@ -2378,16 +2378,16 @@ function Show-UserReportCard {
     Add-AirlineField $f 24 118 180 'Aircraft' $simName $theme
     Add-AirlineField $f 220 118 176 'Log no.' $logId $theme
 
-    Add-AirlineHairline $f 24 160 372 $theme.Line
     $sec = New-Object System.Windows.Forms.Label
-    $sec.Text = '  PERFORMANCE  '
+    $sec.Text = 'PERFORMANCE'
     $sec.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
     $sec.ForeColor = $theme.Gold
     $sec.BackColor = $theme.Navy
     $sec.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-    $sec.AutoSize = $true
-    $sec.Location = New-Object System.Drawing.Point 155, 152
+    $sec.Location = New-Object System.Drawing.Point 0, 148
+    $sec.Size = New-Object System.Drawing.Size 420, 16
     $f.Controls.Add($sec)
+    Add-AirlineHairline $f 24 168 372 $theme.Line
 
     $stamp = New-Object System.Windows.Forms.PictureBox
     $stamp.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::CenterImage
