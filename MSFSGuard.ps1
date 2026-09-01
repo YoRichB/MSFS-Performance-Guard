@@ -17,7 +17,8 @@
 [CmdletBinding()]
 param(
     [switch]$Visible,
-    [switch]$WriteTestReport
+    [switch]$WriteTestReport,
+    [switch]$ShowLastReport
 )
 
 $ErrorActionPreference = 'Continue'
@@ -26,7 +27,9 @@ $script:ConfigPath = Join-Path $script:Root 'Config.json'
 $script:StatePath = Join-Path $script:Root 'state.json'
 $script:LogDir = Join-Path $script:Root 'Logs'
 
-if ($WriteTestReport) {
+$script:Headless = [bool]($WriteTestReport -or $ShowLastReport)
+
+if ($WriteTestReport -or $ShowLastReport) {
     # Fall through. Mutex / tray are skipped after functions load.
 }
 
@@ -34,7 +37,8 @@ if (-not $WriteTestReport -and [Threading.Thread]::CurrentThread.GetApartmentSta
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $arg = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$PSCommandPath`""
     if ($Visible) { $arg += ' -Visible' }
-    $style = if ($Visible) { 'Normal' } else { 'Hidden' }
+    if ($ShowLastReport) { $arg += ' -ShowLastReport' }
+    $style = if ($Visible -or $ShowLastReport) { 'Normal' } else { 'Hidden' }
     Start-Process -FilePath $ps -ArgumentList $arg -WindowStyle $style
     exit
 }
@@ -44,7 +48,7 @@ if (-not $WriteTestReport -and [Threading.Thread]::CurrentThread.GetApartmentSta
 # -----------------------------------------------------------------------------
 $script:CreatedMutex = $true
 $script:Mutex = $null
-if (-not $WriteTestReport) {
+if (-not $script:Headless) {
     $script:CreatedMutex = $false
     $script:Mutex = New-Object System.Threading.Mutex($true, 'Local\MSFSPerformanceGuard', [ref]$script:CreatedMutex)
     if (-not $script:CreatedMutex) {
@@ -59,11 +63,13 @@ if (-not $WriteTestReport) {
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 Add-Type -AssemblyName System.Drawing | Out-Null
 if (-not $WriteTestReport) {
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+}
+if (-not $script:Headless) {
     $script:StopEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Local\MSFSPerformanceGuard-Stop')
     $script:ShowEvent = New-Object System.Threading.EventWaitHandle($false, 'AutoReset', 'Local\MSFSPerformanceGuard-Show')
     [void]$script:StopEvent.Reset()
     [void]$script:ShowEvent.Reset()
-    [System.Windows.Forms.Application]::EnableVisualStyles()
 }
 
 if (-not $WriteTestReport -and -not ('GuardToastForm' -as [type])) {
@@ -197,6 +203,7 @@ function Get-DefaultConfig {
         DismissMinutes             = 15
         AutoResumeWhenMsfsExits    = $true
         AutoSleepKnownHogs         = $false
+        ShowSuggestionOverlay      = $false
         MaxSuggestions             = 5
         ShowWelcome                = $true
         ShowCornerBadge            = $false
@@ -831,8 +838,25 @@ function Start-FpsCapture {
     }
 }
 
+function Measure-FpsList {
+    param($Vals)
+    $out = @{ Count = 0; Avg = 0.0; Min = 0.0; Max = 0.0; AvgMs = 0.0 }
+    if (-not $Vals -or $Vals.Count -le 0) { return $out }
+    $m = $Vals | Measure-Object -Average -Minimum -Maximum
+    $out.Count = [int]$m.Count
+    $out.Avg = [math]::Round([double]$m.Average, 1)
+    $out.Min = [math]::Round([double]$m.Minimum, 1)
+    $out.Max = [math]::Round([double]$m.Maximum, 1)
+    if ($out.Avg -gt 0) { $out.AvgMs = [math]::Round(1000.0 / $out.Avg, 1) }
+    return $out
+}
+
 function Stop-FpsCapture {
-    $stats = @{ Count = 0; Avg = 0.0; Min = 0.0; Max = 0.0; AvgMs = 0.0; Source = 'none'; SimSpeed = 1.0 }
+    $stats = @{
+        Count = 0; Avg = 0.0; Min = 0.0; Max = 0.0; AvgMs = 0.0; Source = 'none'; SimSpeed = 1.0
+        GameplayCount = 0; GameplayAvg = 0.0; GameplayMin = 0.0; GameplayMax = 0.0; GameplayAvgMs = 0.0
+        GameplayKnown = $false
+    }
     if ($script:SimConnectPid) {
         try { Stop-Process -Id $script:SimConnectPid -Force -ErrorAction SilentlyContinue } catch { }
         $script:SimConnectPid = $null
@@ -845,23 +869,49 @@ function Stop-FpsCapture {
     }
     if ($script:SimConnectCsv -and (Test-Path -LiteralPath $script:SimConnectCsv)) {
         try {
-            $rows = Import-Csv -LiteralPath $script:SimConnectCsv
+            $rows = @(Import-Csv -LiteralPath $script:SimConnectCsv)
             $vals = New-Object System.Collections.Generic.List[double]
+            $play = New-Object System.Collections.Generic.List[double]
             $spd = 1.0
+            $hasSimCol = $false
+            if ($rows.Count -gt 0) {
+                $hasSimCol = @($rows[0].PSObject.Properties.Name) -contains 'Sim'
+            }
             foreach ($r in $rows) {
                 $v = 0.0
-                if ([double]::TryParse([string]$r.Fps, [ref]$v) -and $v -gt 1 -and $v -lt 400) { [void]$vals.Add($v) }
+                if (-not [double]::TryParse([string]$r.Fps, [ref]$v) -or $v -le 1 -or $v -ge 400) { continue }
+                [void]$vals.Add($v)
                 $s = 0.0
                 if ([double]::TryParse([string]$r.SimSpeed, [ref]$s) -and $s -gt 0) { $spd = $s }
+                $inFlight = $false
+                if ($hasSimCol) {
+                    $sim = 0; $paused = 0
+                    [void][int]::TryParse([string]$r.Sim, [ref]$sim)
+                    [void][int]::TryParse([string]$r.Paused, [ref]$paused)
+                    $inFlight = ($sim -eq 1 -and $paused -eq 0)
+                    $stats.GameplayKnown = $true
+                } else {
+                    $inFlight = ($spd -ge 0.9 -and $spd -le 1.15 -and $v -ge 12)
+                }
+                if ($inFlight) { [void]$play.Add($v) }
             }
             if ($vals.Count -gt 5) {
-                $stats.Count = $vals.Count
-                $stats.Avg = [math]::Round((($vals | Measure-Object -Average).Average), 1)
-                $stats.Min = [math]::Round((($vals | Measure-Object -Minimum).Minimum), 1)
-                $stats.Max = [math]::Round((($vals | Measure-Object -Maximum).Maximum), 1)
-                if ($stats.Avg -gt 0) { $stats.AvgMs = [math]::Round(1000.0 / $stats.Avg, 1) }
+                $all = Measure-FpsList $vals
+                $stats.Count = $all.Count
+                $stats.Avg = $all.Avg
+                $stats.Min = $all.Min
+                $stats.Max = $all.Max
+                $stats.AvgMs = $all.AvgMs
                 $stats.Source = 'simconnect'
                 $stats.SimSpeed = [math]::Round($spd, 2)
+                if ($play.Count -gt 5) {
+                    $gp = Measure-FpsList $play
+                    $stats.GameplayCount = $gp.Count
+                    $stats.GameplayAvg = $gp.Avg
+                    $stats.GameplayMin = $gp.Min
+                    $stats.GameplayMax = $gp.Max
+                    $stats.GameplayAvgMs = $gp.AvgMs
+                }
                 return $stats
             }
         } catch {
@@ -1522,9 +1572,9 @@ function Update-SessionSample {
 }
 
 function Add-SessionSuggestionShown {
-    param($Offenders)
+    param($Offenders, [bool]$Shown = $true)
     if (-not $script:Session) { return }
-    $script:Session.ToastShown++
+    if ($Shown) { $script:Session.ToastShown++ }
     if ($null -eq $script:Session.SuggestedNames) {
         $script:Session.SuggestedNames = New-IgnoreSet -Names @()
     }
@@ -1561,6 +1611,64 @@ function Get-LetterGrade {
     if ($Score -ge 70) { return 'C' }
     if ($Score -ge 55) { return 'D' }
     return 'F'
+}
+
+function Get-SimShortName {
+    param([string]$Name)
+    switch -Regex ($Name) {
+        '2024' { return 'MSFS 2024' }
+        'FlightSimulator' { return 'MSFS 2020' }
+        default { if ($Name) { return $Name } else { return 'Flight Simulator' } }
+    }
+}
+
+function Get-GradeColor {
+    param([string]$Grade)
+    switch ($Grade) {
+        'A' { return $script:C.Ok }
+        'B' { return [System.Drawing.Color]::FromArgb(72, 188, 168) }
+        'C' { return $script:C.Warn }
+        'D' { return [System.Drawing.Color]::FromArgb(232, 124, 56) }
+        'F' { return $script:C.Err }
+        default { return $script:C.Muted }
+    }
+}
+
+function Get-GameplayGrade {
+    param(
+        [double]$Avg,
+        [int]$Cap = 0
+    )
+    if ($Avg -le 0) {
+        return @{ Grade = '-'; Score = 0; Label = 'No in-flight FPS' }
+    }
+    $score = 0
+    if ($Cap -ge 20) {
+        $ratio = $Avg / [double]$Cap
+        if ($ratio -ge 0.95) { $score = [int][math]::Min(100, [math]::Round(90 + (10 * ($ratio - 0.95) / 0.15))) }
+        elseif ($ratio -ge 0.85) { $score = [int][math]::Round(80 + (10 * ($ratio - 0.85) / 0.10)) }
+        elseif ($ratio -ge 0.70) { $score = [int][math]::Round(70 + (10 * ($ratio - 0.70) / 0.15)) }
+        elseif ($ratio -ge 0.50) { $score = [int][math]::Round(55 + (15 * ($ratio - 0.50) / 0.20)) }
+        else { $score = [int][math]::Max(0, [math]::Round(54 * ($ratio / 0.50))) }
+    } else {
+        # Uncapped MSFS: 60 is excellent, 45 comfortable, 30 playable, 20 choppy.
+        if ($Avg -ge 60) { $score = [int][math]::Min(100, [math]::Round(90 + [math]::Min(10, ($Avg - 60) / 4.0))) }
+        elseif ($Avg -ge 45) { $score = [int][math]::Round(80 + (10 * ($Avg - 45) / 15.0)) }
+        elseif ($Avg -ge 30) { $score = [int][math]::Round(70 + (10 * ($Avg - 30) / 15.0)) }
+        elseif ($Avg -ge 20) { $score = [int][math]::Round(55 + (15 * ($Avg - 20) / 10.0)) }
+        else { $score = [int][math]::Max(0, [math]::Round(54 * ($Avg / 20.0))) }
+    }
+    if ($score -gt 100) { $score = 100 }
+    if ($score -lt 0) { $score = 0 }
+    $letter = Get-LetterGrade $score
+    $label = switch ($letter) {
+        'A' { 'Smooth' }
+        'B' { 'Comfortable' }
+        'C' { 'Playable' }
+        'D' { 'Choppy' }
+        default { 'Poor' }
+    }
+    return @{ Grade = $letter; Score = $score; Label = $label }
 }
 
 function Format-Duration {
@@ -1666,7 +1774,7 @@ function Get-SessionSuggestions {
         Add-Idea 'medium' 'lists' ("Sim companion was expensive: {0}" -f $c.Label) `
             ("{0} is allowlisted (so it is never suggested) but peaked at {1:n1}% CPU / {2} MB." -f $c.Label, $c.MaxCpu, $c.MaxMemMB) `
             'Leave it allowlisted if you need it for the flight. If not, remove it from CompanionAllowlist.' `
-            ("Do not auto-remove companions. Add an optional 'expensive companion' info toast for '{0}' that cannot Sleep it, only inform." -f $c.Name)
+            ("Do not auto-remove companions. Keep '{0}' in the Grok briefing when it is expensive. Do not show a user toast." -f $c.Name)
     }
 
     if ($Session.Dismissed -ge 2 -and $Session.Dismissed -ge $acted) {
@@ -1676,7 +1784,7 @@ function Get-SessionSuggestions {
             'Tune default thresholds upward, or add a "too noisy" mode that requires a higher score before Show-Toast.'
     }
 
-    if ($Session.ToastShown -eq 0 -and $Avg.OtherCpuAvg -ge [math]::Max(2.0, [double]$script:Config.CpuPercentThreshold * $scale)) {
+    if ((Test-ShowSuggestionOverlay) -and $Session.ToastShown -eq 0 -and $Avg.OtherCpuAvg -ge [math]::Max(2.0, [double]$script:Config.CpuPercentThreshold * $scale)) {
         Add-Idea 'medium' 'detection' 'Other programs used CPU but nothing was suggested' `
             ("Non-sim CPU averaged {0:n1}% and no overlay appeared." -f $Avg.OtherCpuAvg) `
             'Lower KnownHogSoftCpuPercent to 2.5 or PersistSamples to 2.' `
@@ -1836,8 +1944,12 @@ function Get-SessionScore {
     $highMiss = @($Ideas | Where-Object { $_.Priority -eq 'high' -and $_.Area -eq 'lists' }).Count
     if ($highMiss -gt 0) { $score -= 10; [void]$notes.Add(('- missed {0} heavy program(s)' -f $highMiss)) }
     if ($Session.ToastShown -eq 0 -and $Avg.OtherCpuAvg -ge 4) {
-        $score -= 8
-        [void]$notes.Add('- other programs used CPU and nothing was suggested')
+        if ($Session.Suggested -and $Session.Suggested.Count -gt 0) {
+            [void]$notes.Add('+ loud programs recorded for Grok (not shown to the user)')
+        } else {
+            $score -= 8
+            [void]$notes.Add('- other programs used CPU and nothing was suggested')
+        }
     }
     if ($Session.PausedSamples -gt [int]($Session.Samples * 0.4)) {
         $score -= 6
@@ -1885,255 +1997,457 @@ function Write-SessionFiles {
     $script:LastReportJson = $jsonPath
     $script:LastSessionGrade = $Payload.Grade
     $script:LastSessionScore = [int]$Payload.Score
+    $script:LastSessionFps = 0.0
+    try { $script:LastSessionFps = [double]$Payload.GameplayFpsAvg } catch { }
+    if ($script:LastSessionFps -le 0) {
+        try { $script:LastSessionFps = [double]$Payload.FpsAvg } catch { }
+    }
     return @{ Json = $jsonPath; Markdown = $mdPath }
 }
 
 function Build-SessionMarkdown {
-    param($Session, $Avg, $ScoreInfo, $Ideas, [timespan]$Duration)
-    $grade = Get-LetterGrade $ScoreInfo.Score
+    param($Session, $Avg, $ScoreInfo, $Ideas, [timespan]$Duration, $Perf)
     $lines = New-Object System.Collections.Generic.List[string]
-    [void]$lines.Add('# MSFS Performance Guard - session report')
+    $grade = if ($Perf -and $Perf.Grade) { [string]$Perf.Grade } else { Get-LetterGrade $ScoreInfo.Score }
+    $fps = 0.0
+    try { $fps = [double]$Session.GameplayFpsAvg } catch { }
+    if ($fps -le 0) { try { $fps = [double]$Session.FpsAvg } catch { } }
+    [void]$lines.Add('# Flight log')
     [void]$lines.Add('')
-    [void]$lines.Add(('**Grade {0} ({1}/100)**' -f $grade, $ScoreInfo.Score))
+    [void]$lines.Add(('**Grade {0}**' -f $grade))
     [void]$lines.Add('')
-    [void]$lines.Add(('| Field | Value |'))
-    [void]$lines.Add('| --- | --- |')
-    [void]$lines.Add(('| Started | {0:yyyy-MM-dd HH:mm:ss} |' -f $Session.StartedAt))
-    [void]$lines.Add(('| Ended | {0:yyyy-MM-dd HH:mm:ss} |' -f $Session.EndedAt))
-    [void]$lines.Add(('| Duration | {0} |' -f (Format-Duration $Duration)))
-    [void]$lines.Add(('| Sim | {0} |' -f $Session.MsfsName))
-    [void]$lines.Add(('| Outcome | {0} |' -f $Session.Outcome))
-    [void]$lines.Add(('| Admin | {0} |' -f $Session.Admin))
-    [void]$lines.Add(('| Cores | {0} |' -f $Session.Cores))
-    [void]$lines.Add(('| Samples | {0} (tick avg {1} ms, max {2} ms) |' -f $Session.Samples, $Avg.TickMsAvg, [int]$Session.TickMsMax))
-    [void]$lines.Add(('| MSFS CPU | avg {0}%  max {1}% |' -f $Avg.MsfsCpuAvg, [math]::Round($Session.MsfsCpuMax, 1)))
-    $ramMin = if ($Session.MsfsRamMin -eq [double]::MaxValue) { 0 } else { [math]::Round($Session.MsfsRamMin, 2) }
-    [void]$lines.Add(('| MSFS RAM | avg {0} GB  max {1} GB  min {2} GB |' -f $Avg.MsfsRamAvgGB, [math]::Round($Session.MsfsRamMax, 2), $ramMin))
-    $freeMin = if ($Session.FreeRamMin -eq [int]::MaxValue) { 0 } else { $Session.FreeRamMin }
-    [void]$lines.Add(('| Free RAM | avg {0} MB  min {1} MB |' -f $Avg.FreeRamAvgMB, $freeMin))
-    [void]$lines.Add(('| Other programs CPU | avg {0}% |' -f $Avg.OtherCpuAvg))
-    $limit = Get-LimitSummary $Session
-    $fpsAvg = 0.0
-    try { $fpsAvg = [double]$Session.FpsAvg } catch { }
-    if ($fpsAvg -gt 0) {
-        $src = if ($Session.FpsSource -eq 'simconnect') { 'sim (SimConnect Frame)' } else { $Session.FpsSource }
-        [void]$lines.Add(('| FPS | avg {0}  min {1}  max {2}  ({3} ms/frame) via {4} |' -f $Session.FpsAvg, $Session.FpsMin, $Session.FpsMax, $Session.FpsAvgMs, $src))
+    if ($fps -gt 0) {
+        [void]$lines.Add(('{0} avg FPS during gameplay' -f $fps))
     } else {
-        [void]$lines.Add('| FPS | not captured (SimConnect/PresentMon missing or too few frames) |')
+        [void]$lines.Add('No in-flight FPS captured')
     }
-    if ($Session.ContainsKey('FrameLimiter')) {
-        [void]$lines.Add(('| Sim settings | cap {0}  VSync {1}  dynamic {2} (target {3})  FG {4} |' -f $Session.FrameLimiter, $Session.VSync, $Session.DynamicSettings, $Session.TargetFrameRate, $Session.FrameGeneration))
-        [void]$lines.Add(('| Sim detail | TLOD {0:n2}  OLOD {1:n2}  clouds {2}  traffic {3} |' -f $Session.Tlod, $Session.Olod, $Session.CloudsQuality, $Session.TrafficQty))
+    $ramAvg = 0.0; $ramMax = 0.0
+    try { $ramAvg = [double]$Avg.MsfsRamAvgGB } catch { }
+    try { $ramMax = [double]$Session.MsfsRamMax } catch { }
+    if ($ramAvg -gt 0 -or $ramMax -gt 0) {
+        [void]$lines.Add(('RAM {0:n1} GB (peak {1:n1} GB)' -f $ramAvg, $ramMax))
     }
-    [void]$lines.Add(('| Limiter | {0} ({1}% of samples) |' -f $limit.DevName, $limit.Percent))
-    [void]$lines.Add(('| Limiter mix | {0} |' -f $limit.When))
-    [void]$lines.Add(('| GPU | avg {0}%  peak {1}%  VRAM peak {2} MB |' -f $limit.GpuAvg, $limit.GpuMax, $limit.VramMaxMB))
-    [void]$lines.Add(('| Whole-PC CPU | avg {0}% |' -f $limit.SysCpuAvg))
-    [void]$lines.Add(('| Disk | queue avg {0}  peak {1}  peak {2} MB/s |' -f $limit.DiskQAvg, $limit.DiskQMax, $limit.DiskMax))
-    [void]$lines.Add(('| Network | avg {0} MB/s  peak {1} MB/s |' -f $limit.NetAvg, $limit.NetMax))
-    [void]$lines.Add(('| Overlays shown | {0} |' -f $Session.ToastShown))
-    [void]$lines.Add(('| Sleep / Close | {0} ok, {1} failed / {2} ok, {3} failed |' -f $Session.SleepOk, $Session.SleepFail, $Session.CloseOk, $Session.CloseFail))
-    [void]$lines.Add(('| Ignore / Never / Dismiss | {0} / {1} / {2} |' -f $Session.Ignored, $Session.Never, $Session.Dismissed))
-    [void]$lines.Add('')
-    [void]$lines.Add('## How well the guard did')
-    [void]$lines.Add('')
-    if ($ScoreInfo.Notes.Count -eq 0) {
-        [void]$lines.Add('- No extra score notes.')
-    } else {
-        foreach ($n in $ScoreInfo.Notes) { [void]$lines.Add("- $n") }
-    }
-    [void]$lines.Add('')
-    [void]$lines.Add('## What limited FPS')
-    [void]$lines.Add('')
-    [void]$lines.Add($limit.Detail)
-    [void]$lines.Add('')
-    [void]$lines.Add(('Limiter mix across the flight: {0}' -f $limit.When))
-    [void]$lines.Add('')
-    [void]$lines.Add('## Suggestions shown')
-    [void]$lines.Add('')
-    if ($Session.Suggested.Count -eq 0) {
-        [void]$lines.Add('None this flight.')
-    } else {
-        foreach ($o in $Session.Suggested) {
-            [void]$lines.Add(('- **{0}** ({1}) - {2}' -f $o.Label, $o.Name, $o.Reason))
+    $gpuAvg = 0.0; $vramMB = 0
+    try {
+        if ([int]$Session.HwSamples -gt 0) {
+            $gpuAvg = [math]::Round([double]$Session.GpuSum / [int]$Session.HwSamples, 1)
         }
-    }
+    } catch { }
+    try { $vramMB = [int]$Session.VramMaxMB } catch { }
+    $gpuBits = New-Object System.Collections.Generic.List[string]
+    if ($gpuAvg -gt 0) { [void]$gpuBits.Add(('{0:n0}%' -f $gpuAvg)) }
+    if ($vramMB -gt 0) { [void]$gpuBits.Add(('VRAM {0:n1} GB' -f ($vramMB / 1024.0))) }
+    if ($gpuBits.Count -gt 0) { [void]$lines.Add(('GPU {0}' -f ($gpuBits -join '  '))) }
     [void]$lines.Add('')
-    [void]$lines.Add('## Your actions')
-    [void]$lines.Add('')
-    if ($Session.Actions.Count -eq 0) {
-        [void]$lines.Add('No Sleep / Close / Ignore / Dismiss this flight.')
-    } else {
-        foreach ($a in $Session.Actions) {
-            $ok = if ($a.Ok) { 'ok' } else { 'FAILED' }
-            $label = if ($a.Label) { $a.Label } else { $a.Type }
-            [void]$lines.Add(('- {0}  **{1}**  {2}  {3}' -f $a.At, $a.Type, $label, $ok))
-        }
-    }
-    [void]$lines.Add('')
-    [void]$lines.Add('## Loudest other programs')
-    [void]$lines.Add('')
-    $tops = Get-TopPeaks $Session 8
-    if ($tops.Count -eq 0) {
-        [void]$lines.Add('Nothing notable besides the sim.')
-    } else {
-        [void]$lines.Add('| Program | Max CPU | Max RAM | Samples | Class |')
-        [void]$lines.Add('| --- | ---: | ---: | ---: | --- |')
-        foreach ($p in $tops) {
-            $cls = 'other'
-            if ($p.Companion) { $cls = 'companion' }
-            elseif ($p.KnownHog) { $cls = 'known hog' }
-            elseif ($p.Allow) { $cls = 'allowlisted' }
-            [void]$lines.Add(('| {0} | {1:n1}% | {2} MB | {3} | {4} |' -f $p.Label, $p.MaxCpu, $p.MaxMemMB, $p.Samples, $cls))
-        }
-    }
-    [void]$lines.Add('')
-    $userIdeas = @(Get-UserFacingIdeas $Ideas)
-    if ($userIdeas.Count -gt 0) {
-        [void]$lines.Add('## What to do next')
-        [void]$lines.Add('')
-        foreach ($idea in $userIdeas) {
-            [void]$lines.Add(('### {0}' -f (Get-ScalarText $idea.Title)))
-            [void]$lines.Add('')
-            [void]$lines.Add((Get-ScalarText $idea.Why))
-            [void]$lines.Add('')
-            [void]$lines.Add((Get-ScalarText $idea.Change))
-            [void]$lines.Add('')
-        }
-    }
+    [void]$lines.Add(('{0}  -  {1}' -f (Format-Duration $Duration), (Get-SimShortName $Session.MsfsName)))
     return ($lines -join "`r`n")
 }
 
-function Get-UserFacingIdeas {
-    param($Ideas)
-    $out = New-Object System.Collections.Generic.List[object]
-    foreach ($idea in @($Ideas)) {
-        if ($null -eq $idea) { continue }
-        if ($idea -is [string]) { continue }
-        $area = Get-ScalarText $idea.Area
-        $title = Get-ScalarText $idea.Title
-        if (-not $title) { continue }
-        if ($area -eq 'none' -or $area -eq 'lists') { continue }
-        if ($title -like 'Missed heavy program*') { continue }
-        [void]$out.Add($idea)
+function Test-ShowSuggestionOverlay {
+    try { return [bool]$script:Config.ShowSuggestionOverlay } catch { return $false }
+}
+
+function Get-ReportFps {
+    param($Payload)
+    $fps = 0.0
+    $inFlight = $false
+    $known = $false
+    try { $known = [bool]$Payload.GameplayKnown } catch { }
+    try {
+        $n = 0
+        try { $n = [int]$Payload.GameplayFpsCount } catch { }
+        if ($n -gt 0) {
+            $fps = [double]$Payload.GameplayFpsAvg
+            $inFlight = $true
+        }
+    } catch { }
+    if ($fps -le 0 -and -not $known) {
+        try { $fps = [double]$Payload.GameplayFpsAvg } catch { }
+        if ($fps -le 0) {
+            try { $fps = [double]$Payload.FpsAvg } catch { }
+        }
     }
-    return $out
+    return @{ Avg = [math]::Round($fps, 0); InFlight = $inFlight; Raw = $fps }
+}
+
+function Get-FlightLogTheme {
+    return @{
+        Navy    = [System.Drawing.Color]::FromArgb(10, 22, 44)
+        Header  = [System.Drawing.Color]::FromArgb(14, 30, 58)
+        Panel   = [System.Drawing.Color]::FromArgb(16, 34, 64)
+        Gold    = [System.Drawing.Color]::FromArgb(201, 162, 74)
+        GoldDim = [System.Drawing.Color]::FromArgb(150, 122, 62)
+        Cream   = [System.Drawing.Color]::FromArgb(244, 236, 214)
+        Muted   = [System.Drawing.Color]::FromArgb(156, 172, 196)
+        Line    = [System.Drawing.Color]::FromArgb(36, 58, 92)
+        Ink     = [System.Drawing.Color]::FromArgb(8, 16, 32)
+    }
+}
+
+function New-LogStampBitmap {
+    param(
+        [string]$Letter,
+        [string]$Caption,
+        [System.Drawing.Color]$Ink,
+        $Theme
+    )
+    $size = 132
+    $bmp = New-Object System.Drawing.Bitmap $size, $size
+    $bmp.SetResolution(96, 96)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
+    $g.Clear([System.Drawing.Color]::Transparent)
+
+    $fill = New-Object System.Drawing.SolidBrush $Theme.Panel
+    $g.FillRectangle($fill, 8, 8, $size - 16, $size - 16)
+    $fill.Dispose()
+
+    $outer = New-Object System.Drawing.Pen $Theme.Gold, 2.2
+    $inner = New-Object System.Drawing.Pen $Theme.GoldDim, 1.0
+    $g.DrawRectangle($outer, 10, 10, $size - 21, $size - 21)
+    $g.DrawRectangle($inner, 16, 16, $size - 33, $size - 33)
+    $outer.Dispose()
+    $inner.Dispose()
+
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $capFont = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
+    $capBrush = New-Object System.Drawing.SolidBrush $Theme.Gold
+    $g.DrawString('DISPATCH GRADE', $capFont, $capBrush, (New-Object System.Drawing.RectangleF 18, 20, ($size - 36), 16), $sf)
+    $letterSize = if ($Letter.Length -gt 1) { 28 } else { 44 }
+    $letterFont = New-Object System.Drawing.Font('Segoe UI Semibold', $letterSize, [System.Drawing.FontStyle]::Bold)
+    $inkBrush = New-Object System.Drawing.SolidBrush $Ink
+    $g.DrawString($Letter, $letterFont, $inkBrush, (New-Object System.Drawing.RectangleF 10, 34, ($size - 20), 70), $sf)
+    $wordFont = New-Object System.Drawing.Font('Segoe UI Semibold', 8)
+    $g.DrawString($Caption.ToUpper(), $wordFont, $capBrush, (New-Object System.Drawing.RectangleF 18, 100, ($size - 36), 18), $sf)
+    $capFont.Dispose(); $capBrush.Dispose(); $letterFont.Dispose(); $inkBrush.Dispose(); $wordFont.Dispose(); $sf.Dispose()
+    $g.Dispose()
+    return $bmp
+}
+
+function Add-AirlineHairline {
+    param($Parent, [int]$X, [int]$Y, [int]$W, $Color)
+    $line = New-Object System.Windows.Forms.Panel
+    $line.BackColor = $Color
+    $line.Location = New-Object System.Drawing.Point $X, $Y
+    $line.Size = New-Object System.Drawing.Size $W, 1
+    $Parent.Controls.Add($line)
+}
+
+function Add-AirlineField {
+    param(
+        $Parent,
+        [int]$X, [int]$Y, [int]$W,
+        [string]$Label,
+        [string]$Value,
+        $Theme
+    )
+    $cap = New-Object System.Windows.Forms.Label
+    $cap.Text = $Label.ToUpper()
+    $cap.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7)
+    $cap.ForeColor = $Theme.Gold
+    $cap.Location = New-Object System.Drawing.Point $X, $Y
+    $cap.Size = New-Object System.Drawing.Size $W, 14
+    $Parent.Controls.Add($cap)
+    $val = New-Object System.Windows.Forms.Label
+    $val.Text = $Value
+    $val.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
+    $val.ForeColor = $Theme.Cream
+    $val.Location = New-Object System.Drawing.Point $X, ($Y + 14)
+    $val.Size = New-Object System.Drawing.Size $W, 22
+    $Parent.Controls.Add($val)
+}
+
+function Add-AirlineStatBox {
+    param(
+        $Parent,
+        [int]$X, [int]$Y, [int]$W, [int]$H,
+        [string]$Title,
+        [string]$Value,
+        [string]$Sub,
+        $Theme
+    )
+    $p = New-Object System.Windows.Forms.Panel
+    $p.Location = New-Object System.Drawing.Point $X, $Y
+    $p.Size = New-Object System.Drawing.Size $W, $H
+    $p.BackColor = $Theme.Panel
+    $gold = New-Object System.Windows.Forms.Panel
+    $gold.BackColor = $Theme.Gold
+    $gold.Dock = [System.Windows.Forms.DockStyle]::Top
+    $gold.Height = 2
+    $p.Controls.Add($gold)
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = $Title.ToUpper()
+    $title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
+    $title.ForeColor = $Theme.Gold
+    $title.Location = New-Object System.Drawing.Point 12, 10
+    $title.Size = New-Object System.Drawing.Size ($W - 24), 14
+    $p.Controls.Add($title)
+    $val = New-Object System.Windows.Forms.Label
+    $val.Text = $Value
+    $val.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 16)
+    $val.ForeColor = $Theme.Cream
+    $val.Location = New-Object System.Drawing.Point 12, 26
+    $val.Size = New-Object System.Drawing.Size ($W - 24), 28
+    $p.Controls.Add($val)
+    $subLbl = New-Object System.Windows.Forms.Label
+    $subLbl.Text = $Sub
+    $subLbl.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $subLbl.ForeColor = $Theme.Muted
+    $subLbl.Location = New-Object System.Drawing.Point 12, 54
+    $subLbl.Size = New-Object System.Drawing.Size ($W - 24), 16
+    $p.Controls.Add($subLbl)
+    $Parent.Controls.Add($p)
+    return $p
+}
+
+function Get-ReportRamGpu {
+    param($Payload)
+    $ramAvg = 0.0; $ramMax = 0.0
+    try { $ramAvg = [double]$Payload.MsfsRamAvgGB } catch { }
+    try { $ramMax = [double]$Payload.MsfsRamMaxGB } catch { }
+    $gpuAvg = 0.0; $gpuMax = 0.0; $vramMB = 0
+    try { $gpuAvg = [double]$Payload.GpuAvg } catch { }
+    try { $gpuMax = [double]$Payload.GpuMax } catch { }
+    try { $vramMB = [int]$Payload.VramMaxMB } catch { }
+    $dash = [string][char]0x2014
+    $ramVal = $dash
+    $ramSub = 'sim average'
+    if ($ramAvg -gt 0) {
+        $ramVal = ('{0:n1} GB' -f $ramAvg)
+        if ($ramMax -gt 0) { $ramSub = ('peak {0:n1} GB' -f $ramMax) }
+    } elseif ($ramMax -gt 0) {
+        $ramVal = ('{0:n1} GB' -f $ramMax)
+        $ramSub = 'peak'
+    }
+    $gpuVal = $dash
+    $gpuSub = 'average'
+    if ($gpuAvg -gt 0.5) {
+        $gpuVal = ('{0:n0}%' -f $gpuAvg)
+        if ($vramMB -gt 0) {
+            $gpuSub = ('VRAM {0:n1} GB' -f ($vramMB / 1024.0))
+        } elseif ($gpuMax -gt 0) {
+            $gpuSub = ('peak {0:n0}%' -f $gpuMax)
+        }
+    } elseif ($vramMB -gt 0) {
+        $gpuVal = ('{0:n1} GB' -f ($vramMB / 1024.0))
+        $gpuSub = 'VRAM peak'
+    } elseif ($gpuMax -gt 0.5) {
+        $gpuVal = ('{0:n0}%' -f $gpuMax)
+        $gpuSub = 'peak'
+    }
+    return @{
+        RamValue = $ramVal
+        RamSub   = $ramSub
+        GpuValue = $gpuVal
+        GpuSub   = $gpuSub
+    }
+}
+
+function Get-FlightLogDate {
+    param($Payload)
+    $raw = $null
+    try { $raw = [string]$Payload.StartedAt } catch { }
+    if ($raw) {
+        try {
+            $dt = [datetime]$raw
+            return $dt.ToString('dd MMM yyyy').ToUpper()
+        } catch { }
+    }
+    return (Get-Date).ToString('dd MMM yyyy').ToUpper()
 }
 
 function Show-UserReportCard {
     param($Payload, $DurationText)
+    $theme = Get-FlightLogTheme
+    $info = Get-ReportFps $Payload
+    $cap = 0
+    try { $cap = [int]$Payload.FrameLimiter } catch { }
+    $storedGrade = ''
+    try { $storedGrade = [string]$Payload.Grade } catch { }
+    $perf = Get-GameplayGrade -Avg $info.Raw -Cap $cap
+    if ($storedGrade -and $storedGrade -match '^[A-F]$' -and [int]$Payload.SchemaVersion -ge 3) {
+        $perf.Grade = $storedGrade
+        try { $perf.Score = [int]$Payload.Score } catch { }
+        try { if ($Payload.GradeLabel) { $perf.Label = [string]$Payload.GradeLabel } } catch { }
+    }
+    $grade = [string]$perf.Grade
+    $color = Get-GradeColor $grade
+    $simName = Get-SimShortName ([string]$Payload.Sim)
+    if (-not $DurationText) {
+        try { $DurationText = [string]$Payload.DurationText } catch { }
+    }
+    if (-not $DurationText) { $DurationText = [string][char]0x2014 }
+    $logId = '--------'
+    try {
+        $id = [string]$Payload.Id
+        if ($id) { $logId = $id.ToUpper() }
+    } catch { }
+    $dateText = Get-FlightLogDate $Payload
+    $fpsText = if ($info.Raw -gt 0) { '{0}' -f $info.Avg } else { [string][char]0x2014 }
+    $fpsSub = if ($info.Raw -gt 0) { 'AVERAGE DURING GAMEPLAY' } else { 'NO IN-FLIGHT FPS' }
+    $hw = Get-ReportRamGpu $Payload
+
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'MSFS Guard - flight report'
-    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
+    $f.Text = 'Flight Log'
+    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
     $f.MaximizeBox = $false
     $f.MinimizeBox = $false
     $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-    $f.Size = New-Object System.Drawing.Size 500, 680
-    $f.BackColor = $script:C.Bg
-    $f.ForeColor = $script:C.Text
+    $f.Size = New-Object System.Drawing.Size 420, 590
+    $f.BackColor = $theme.Navy
+    $f.ForeColor = $theme.Cream
     $f.TopMost = $true
     $f.ShowInTaskbar = $true
+    $f.KeyPreview = $true
+    $f.Add_KeyDown({
+            if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $this.Close() }
+        })
     if ($script:IconOk) { $f.Icon = $script:IconOk }
+    try {
+        $prop = $f.GetType().GetProperty('DoubleBuffered', [Reflection.BindingFlags]'Instance,NonPublic')
+        if ($prop) { $prop.SetValue($f, $true, $null) }
+    } catch { }
 
-    $stripe = New-Object System.Windows.Forms.Panel
-    $stripe.BackColor = $script:C.Accent
-    $stripe.Dock = [System.Windows.Forms.DockStyle]::Left
-    $stripe.Width = 6
-    $f.Controls.Add($stripe)
+    $f.Add_Load({
+            if ('GuardToastForm' -as [type]) {
+                $rgn = [GuardToastForm]::CreateRoundRectRgn(0, 0, ($this.Width + 1), ($this.Height + 1), 14, 14)
+                $this.Region = [System.Drawing.Region]::FromHrgn($rgn)
+            }
+        })
 
-    $y = 16
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = 'Flight report'
-    $title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 14)
-    $title.ForeColor = $script:C.Text
-    $title.Location = New-Object System.Drawing.Point 22, $y
-    $title.AutoSize = $true
-    $f.Controls.Add($title)
-    $y += 34
+    $livery = New-Object System.Windows.Forms.Panel
+    $livery.BackColor = $theme.Gold
+    $livery.Dock = [System.Windows.Forms.DockStyle]::Top
+    $livery.Height = 6
+    $f.Controls.Add($livery)
 
-    $grade = New-Object System.Windows.Forms.Label
-    $grade.Text = ('Grade {0}  -  {1}' -f $Payload.Grade, $DurationText)
-    $grade.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
-    $grade.ForeColor = $script:C.Ok
-    $grade.Location = New-Object System.Drawing.Point 22, $y
-    $grade.AutoSize = $true
-    $f.Controls.Add($grade)
-    $y += 32
+    $header = New-Object System.Windows.Forms.Panel
+    $header.BackColor = $theme.Header
+    $header.Location = New-Object System.Drawing.Point 0, 6
+    $header.Size = New-Object System.Drawing.Size 420, 56
+    $f.Controls.Add($header)
 
-    $slept = @($Payload.Actions | Where-Object { $_.Type -eq 'sleep' -and $_.Ok } | ForEach-Object { Get-FriendlyName $_.Name })
-    $closed = @($Payload.Actions | Where-Object { $_.Type -eq 'close' -and $_.Ok } | ForEach-Object { Get-FriendlyName $_.Name })
-    $what = New-Object System.Collections.Generic.List[string]
-    [void]$what.Add(('Simulator: {0}' -f $Payload.Sim))
-    if ([double]$Payload.FpsAvg -gt 0) {
-        $src = if ($Payload.FpsSource -eq 'simconnect') { 'sim FPS' } else { 'display FPS' }
-        [void]$what.Add(('{0} avg {1}  (low {2}, high {3})  -  {4} ms/frame' -f $src, $Payload.FpsAvg, $Payload.FpsMin, $Payload.FpsMax, $Payload.FpsAvgMs))
-    } else {
-        [void]$what.Add('FPS: not captured this flight')
-    }
-    $setBits = New-Object System.Collections.Generic.List[string]
-    if ([int]$Payload.FrameLimiter -gt 0) { [void]$setBits.Add(('Max frame rate {0}' -f $Payload.FrameLimiter)) }
-    if ([bool]$Payload.VSync) { [void]$setBits.Add('VSync on') }
-    if ([bool]$Payload.DynamicSettings) { [void]$setBits.Add(('Dynamic settings target {0}' -f $Payload.TargetFrameRate)) }
-    if ($Payload.FrameGeneration -and $Payload.FrameGeneration -ne 'NONE') { [void]$setBits.Add(('Frame gen {0}' -f $Payload.FrameGeneration)) }
-    if ([double]$Payload.Tlod -gt 0) { [void]$setBits.Add(('TLOD {0:n2}' -f $Payload.Tlod)) }
-    if ([double]$Payload.Olod -gt 0) { [void]$setBits.Add(('OLOD {0:n2}' -f $Payload.Olod)) }
-    if ([int]$Payload.CloudsQuality -ge 0) { [void]$setBits.Add(('Clouds {0}' -f (Get-QualityName $Payload.CloudsQuality))) }
-    if ($setBits.Count -gt 0) { [void]$what.Add(('Sim settings: {0}' -f ($setBits -join ', '))) }
-    if ($Payload.LimitDevName) {
-        [void]$what.Add(('{0}  ({1}% of the flight)' -f $Payload.LimitDevName, $Payload.LimitPercent))
-        if ($Payload.LimitWhen) { [void]$what.Add(('Limiter mix: {0}' -f $Payload.LimitWhen)) }
-    }
-    [void]$what.Add(('CPU: sim {0}% avg (peak {1}%)  |  whole PC {2}% avg' -f $Payload.MsfsCpuAvg, $Payload.MsfsCpuMax, $Payload.SysCpuAvg))
-    if ($null -ne $Payload.GpuAvg) {
-        $vram = if ([int]$Payload.VramMaxMB -gt 0) { '  |  VRAM peak {0:n1} GB' -f ($Payload.VramMaxMB / 1024.0) } else { '' }
-        [void]$what.Add(('GPU: {0}% avg (peak {1}%){2}' -f $Payload.GpuAvg, $Payload.GpuMax, $vram))
-    }
-    [void]$what.Add(('RAM: sim {0} GB avg (peak {1} GB)' -f $Payload.MsfsRamAvgGB, $Payload.MsfsRamMaxGB))
-    if ($Payload.FreeRamMinMB) {
-        [void]$what.Add(('Lowest free RAM: {0:n1} GB' -f ($Payload.FreeRamMinMB / 1024.0)))
-    }
-    if ($null -ne $Payload.DiskQAvg) {
-        [void]$what.Add(('Disk: queue avg {0} (peak {1})  |  peak {2} MB/s' -f $Payload.DiskQAvg, $Payload.DiskQMax, $Payload.DiskMBpsMax))
-    }
-    if ($null -ne $Payload.NetAvgMBps) {
-        [void]$what.Add(('Network: avg {0} MB/s (peak {1} MB/s)' -f $Payload.NetAvgMBps, $Payload.NetMaxMBps))
-    }
-    if ($slept.Count -gt 0) { [void]$what.Add(('Put to sleep: {0}' -f ($slept -join ', '))) }
-    if ($closed.Count -gt 0) { [void]$what.Add(('Closed: {0}' -f ($closed -join ', '))) }
-    if ($slept.Count -eq 0 -and $closed.Count -eq 0) { [void]$what.Add('No programs were slept or closed.') }
-    [void]$what.Add('Slept programs were resumed when the sim exited.')
+    $wing = New-Object System.Windows.Forms.PictureBox
+    $wing.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::CenterImage
+    $wing.Location = New-Object System.Drawing.Point 16, 10
+    $wing.Size = New-Object System.Drawing.Size 36, 36
+    $wing.BackColor = $theme.Header
+    $wing.Image = (New-GuardBitmap 28 $theme.Gold)
+    $header.Controls.Add($wing)
 
-    $body = New-Object System.Windows.Forms.Label
-    $body.Text = ($what -join [Environment]::NewLine)
-    $body.ForeColor = $script:C.Text
-    $body.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-    $body.Location = New-Object System.Drawing.Point 22, $y
-    $body.Size = New-Object System.Drawing.Size 450, 260
-    $f.Controls.Add($body)
-    $y += 268
+    $co = New-Object System.Windows.Forms.Label
+    $co.Text = 'MSFS GUARD'
+    $co.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 11)
+    $co.ForeColor = $theme.Cream
+    $co.Location = New-Object System.Drawing.Point 56, 8
+    $co.Size = New-Object System.Drawing.Size 200, 22
+    $header.Controls.Add($co)
+    $coSub = New-Object System.Windows.Forms.Label
+    $coSub.Text = 'AIRLINE OPERATIONS'
+    $coSub.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
+    $coSub.ForeColor = $theme.Gold
+    $coSub.Location = New-Object System.Drawing.Point 56, 30
+    $coSub.Size = New-Object System.Drawing.Size 200, 16
+    $header.Controls.Add($coSub)
 
-    $userIdeas = @(Get-UserFacingIdeas $Payload.Suggestions)
-    $next = New-Object System.Windows.Forms.Label
-    $next.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-    $next.ForeColor = $script:C.Muted
-    $next.Location = New-Object System.Drawing.Point 22, $y
-    $next.Size = New-Object System.Drawing.Size 450, 150
-    if ($userIdeas.Count -eq 0) {
-        $next.Text = 'Nothing else you need to do. The sim had enough RAM and the guard stayed out of the way of add-ons.'
-    } else {
-        $bits = New-Object System.Collections.Generic.List[string]
-        [void]$bits.Add('Next time:')
-        foreach ($idea in ($userIdeas | Select-Object -First 3)) {
-            [void]$bits.Add(('- {0}' -f (Get-ScalarText $idea.Change)))
-        }
-        $next.Text = ($bits -join [Environment]::NewLine)
-    }
-    $f.Controls.Add($next)
+    $doc = New-Object System.Windows.Forms.Label
+    $doc.Text = 'FLIGHT LOG'
+    $doc.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10)
+    $doc.ForeColor = $theme.Gold
+    $doc.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    $doc.Location = New-Object System.Drawing.Point 250, 8
+    $doc.Size = New-Object System.Drawing.Size 154, 22
+    $header.Controls.Add($doc)
+    $docSub = New-Object System.Windows.Forms.Label
+    $docSub.Text = 'TECHNICAL REPORT'
+    $docSub.Font = New-Object System.Drawing.Font('Segoe UI', 7.5)
+    $docSub.ForeColor = $theme.Muted
+    $docSub.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    $docSub.Location = New-Object System.Drawing.Point 250, 30
+    $docSub.Size = New-Object System.Drawing.Size 154, 16
+    $header.Controls.Add($docSub)
 
-    $btn = New-FlatButton 'Done' 340 600 110 32 $script:C.Ok ([System.Drawing.Color]::FromArgb(20, 28, 24))
-    $btn.Add_Click({ $f.Close() })
+    Add-AirlineHairline $f 0 62 420 $theme.Gold
+
+    Add-AirlineField $f 24 76 180 'Date' $dateText $theme
+    Add-AirlineField $f 220 76 176 'Block time' $DurationText $theme
+    Add-AirlineField $f 24 118 180 'Aircraft' $simName $theme
+    Add-AirlineField $f 220 118 176 'Log no.' $logId $theme
+
+    Add-AirlineHairline $f 24 160 372 $theme.Line
+    $sec = New-Object System.Windows.Forms.Label
+    $sec.Text = '  PERFORMANCE  '
+    $sec.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
+    $sec.ForeColor = $theme.Gold
+    $sec.BackColor = $theme.Navy
+    $sec.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $sec.AutoSize = $true
+    $sec.Location = New-Object System.Drawing.Point 155, 152
+    $f.Controls.Add($sec)
+
+    $stamp = New-Object System.Windows.Forms.PictureBox
+    $stamp.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::CenterImage
+    $stamp.Location = New-Object System.Drawing.Point 24, 176
+    $stamp.Size = New-Object System.Drawing.Size 132, 132
+    $stamp.BackColor = $theme.Navy
+    $stamp.Image = (New-LogStampBitmap $grade ([string]$perf.Label) $color $theme)
+    $f.Controls.Add($stamp)
+
+    $fpsCap = New-Object System.Windows.Forms.Label
+    $fpsCap.Text = 'AVG FPS'
+    $fpsCap.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8)
+    $fpsCap.ForeColor = $theme.Gold
+    $fpsCap.Location = New-Object System.Drawing.Point 172, 196
+    $fpsCap.Size = New-Object System.Drawing.Size 220, 16
+    $f.Controls.Add($fpsCap)
+    $fpsNum = New-Object System.Windows.Forms.Label
+    $fpsNum.Text = $fpsText
+    $fpsNum.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 36)
+    $fpsNum.ForeColor = $theme.Cream
+    $fpsNum.Location = New-Object System.Drawing.Point 168, 212
+    $fpsNum.Size = New-Object System.Drawing.Size 228, 56
+    $f.Controls.Add($fpsNum)
+    $fpsNote = New-Object System.Windows.Forms.Label
+    $fpsNote.Text = $fpsSub
+    $fpsNote.Font = New-Object System.Drawing.Font('Segoe UI', 8)
+    $fpsNote.ForeColor = $theme.Muted
+    $fpsNote.Location = New-Object System.Drawing.Point 172, 268
+    $fpsNote.Size = New-Object System.Drawing.Size 220, 16
+    $f.Controls.Add($fpsNote)
+
+    $ramBox = Add-AirlineStatBox $f 24 324 180 78 'RAM' $hw.RamValue $hw.RamSub $theme
+    $gpuBox = Add-AirlineStatBox $f 216 324 180 78 'GPU' $hw.GpuValue $hw.GpuSub $theme
+
+    Add-AirlineHairline $f 24 418 372 $theme.Line
+    $end = New-Object System.Windows.Forms.Label
+    $end.Text = 'END OF LOG  -  NO DISPATCH REMARKS'
+    $end.Font = New-Object System.Drawing.Font('Segoe UI', 7.5)
+    $end.ForeColor = $theme.Muted
+    $end.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $end.Location = New-Object System.Drawing.Point 0, 428
+    $end.Size = New-Object System.Drawing.Size 420, 16
+    $f.Controls.Add($end)
+
+    $btn = New-FlatButton 'FILE LOG' 140 460 140 36 $theme.Gold $theme.Ink
+    $btn.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
+    $btn.Add_Click({ $this.FindForm().Close() })
     $f.Controls.Add($btn)
+    $f.AcceptButton = $btn
+    $f.CancelButton = $btn
+
+    $bottom = New-Object System.Windows.Forms.Panel
+    $bottom.BackColor = $theme.Gold
+    $bottom.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $bottom.Height = 6
+    $f.Controls.Add($bottom)
+
     [void]$f.ShowDialog()
+    if ($stamp.Image) { $stamp.Image.Dispose() }
+    if ($wing.Image) { $wing.Image.Dispose() }
 }
 
 function Finish-AfterSession {
@@ -2203,7 +2517,16 @@ function Update-GrokBriefing {
     [void]$lines.Add('It is rewritten after every Flight Simulator session from real telemetry, not guesses.')
     [void]$lines.Add('')
     [void]$lines.Add(('Last updated: {0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date)))
-    [void]$lines.Add(('Latest session: grade **{0}** ({1}/100), {2}, {3}.' -f $LatestPayload.Grade, $LatestPayload.Score, $LatestPayload.Sim, $LatestPayload.DurationText))
+    $briefFps = 0.0
+    try { $briefFps = [double]$LatestPayload.GameplayFpsAvg } catch { }
+    if ($briefFps -le 0) { try { $briefFps = [double]$LatestPayload.FpsAvg } catch { } }
+    $guardBit = ''
+    try {
+        if ($LatestPayload.GuardGrade) {
+            $guardBit = (', guard **{0}** ({1}/100)' -f $LatestPayload.GuardGrade, $LatestPayload.GuardScore)
+        }
+    } catch { }
+    [void]$lines.Add(('Latest session: flight **{0}** ({1} FPS){2}, {3}, {4}.' -f $LatestPayload.Grade, $briefFps, $guardBit, $LatestPayload.Sim, $LatestPayload.DurationText))
     [void]$lines.Add('')
     [void]$lines.Add('This file is **developer-only**. It is never shown on the on-screen flight report card.')
     [void]$lines.Add('')
@@ -2217,7 +2540,7 @@ function Update-GrokBriefing {
     [void]$lines.Add(('| MSFS CPU | avg {0}% max {1}% |' -f $LatestPayload.MsfsCpuAvg, $LatestPayload.MsfsCpuMax))
     [void]$lines.Add(('| MSFS RAM | avg {0} GB max {1} GB |' -f $LatestPayload.MsfsRamAvgGB, $LatestPayload.MsfsRamMaxGB))
     [void]$lines.Add(('| Other CPU | avg {0}% |' -f $LatestPayload.OtherCpuAvg))
-    [void]$lines.Add(('| FPS | avg {0} min {1} max {2} via {3} |' -f $LatestPayload.FpsAvg, $LatestPayload.FpsMin, $LatestPayload.FpsMax, $LatestPayload.FpsSource))
+    [void]$lines.Add(('| FPS | gameplay avg {0} (session avg {1} min {2} max {3}) via {4} |' -f $LatestPayload.GameplayFpsAvg, $LatestPayload.FpsAvg, $LatestPayload.FpsMin, $LatestPayload.FpsMax, $LatestPayload.FpsSource))
     [void]$lines.Add(('| Sim settings | cap {0} VSync {1} TLOD {2} clouds {3} |' -f $LatestPayload.FrameLimiter, $LatestPayload.VSync, $LatestPayload.Tlod, $LatestPayload.CloudsQuality))
     [void]$lines.Add(('| Limiter | {0} ({1}%) mix {2} |' -f $LatestPayload.LimitDevName, $LatestPayload.LimitPercent, $LatestPayload.LimitWhen))
     [void]$lines.Add(('| GPU / VRAM | avg {0}% peak {1}% / {2} MB |' -f $LatestPayload.GpuAvg, $LatestPayload.GpuMax, $LatestPayload.VramMaxMB))
@@ -2241,17 +2564,18 @@ function Update-GrokBriefing {
             [void]$lines.Add('')
             [void]$lines.Add(('**Implement:** {0}' -f $t.GrokTask))
             [void]$lines.Add('')
-            [void]$lines.Add(('**User-facing workaround today:** {0}' -f $t.Change))
-            [void]$lines.Add('')
             $i++
         }
     }
     [void]$lines.Add('## Recent sessions')
     [void]$lines.Add('')
-    [void]$lines.Add('| When | Sim | Duration | Grade | Overlays | Sleep ok | Dismiss |')
-    [void]$lines.Add('| --- | --- | --- | --- | ---: | ---: | ---: |')
+    [void]$lines.Add('| When | Sim | Duration | Grade | FPS | Overlays | Sleep ok | Dismiss |')
+    [void]$lines.Add('| --- | --- | --- | --- | ---: | ---: | ---: | ---: |')
     foreach ($s in $sessions) {
-        [void]$lines.Add(('| {0} | {1} | {2} | {3} ({4}) | {5} | {6} | {7} |' -f $s.EndedAt, $s.Sim, $s.DurationText, $s.Grade, $s.Score, $s.ToastShown, $s.SleepOk, $s.Dismissed))
+        $rowFps = 0.0
+        try { $rowFps = [double]$s.GameplayFpsAvg } catch { }
+        if ($rowFps -le 0) { try { $rowFps = [double]$s.FpsAvg } catch { } }
+        [void]$lines.Add(('| {0} | {1} | {2} | {3} ({4}) | {5} | {6} | {7} | {8} |' -f $s.EndedAt, $s.Sim, $s.DurationText, $s.Grade, $s.Score, $rowFps, $s.ToastShown, $s.SleepOk, $s.Dismissed))
     }
     [void]$lines.Add('')
     [void]$lines.Add('## How to work this repo')
@@ -2281,7 +2605,7 @@ function Write-GrokSessionNotes {
     [void]$lines.Add('')
     [void]$lines.Add('Not shown on the user flight report card.')
     [void]$lines.Add('')
-    [void]$lines.Add(('**{0}** - grade {1} ({2}/100) - {3} - {4}' -f $Payload.Sim, $Payload.Grade, $Payload.Score, $Payload.DurationText, $Payload.Outcome))
+    [void]$lines.Add(('**{0}** - flight {1} ({2} FPS) - guard {3} ({4}/100) - {5} - {6}' -f $Payload.Sim, $Payload.Grade, $Payload.GameplayFpsAvg, $Payload.GuardGrade, $Payload.GuardScore, $Payload.DurationText, $Payload.Outcome))
     [void]$lines.Add('')
     [void]$lines.Add('## How the session went')
     [void]$lines.Add('')
@@ -2289,7 +2613,7 @@ function Write-GrokSessionNotes {
     [void]$lines.Add(('- Samples: {0}; tick avg {1} ms (max {2} ms); errors {3}' -f $Payload.Samples, $Payload.TickMsAvg, $Payload.TickMsMax, $Payload.TickErrors))
     [void]$lines.Add(('- MSFS CPU avg {0}% peak {1}%; RAM avg {2} GB peak {3} GB' -f $Payload.MsfsCpuAvg, $Payload.MsfsCpuMax, $Payload.MsfsRamAvgGB, $Payload.MsfsRamMaxGB))
     [void]$lines.Add(('- Other programs CPU avg {0}%' -f $Payload.OtherCpuAvg))
-    [void]$lines.Add(('- FPS avg {0} min {1} max {2} ({3} ms) samples {4} via {5}' -f $Payload.FpsAvg, $Payload.FpsMin, $Payload.FpsMax, $Payload.FpsAvgMs, $Payload.FpsCount, $Payload.FpsSource))
+    [void]$lines.Add(('- FPS gameplay avg {0} (session avg {1} min {2} max {3}) samples {4} via {5}' -f $Payload.GameplayFpsAvg, $Payload.FpsAvg, $Payload.FpsMin, $Payload.FpsMax, $Payload.FpsCount, $Payload.FpsSource))
     [void]$lines.Add(('- Sim UserCfg: cap {0}, VSync {1}, dynamic {2}/{3}, FG {4}, TLOD {5}, OLOD {6}, clouds {7}, traffic {8}' -f $Payload.FrameLimiter, $Payload.VSync, $Payload.DynamicSettings, $Payload.TargetFrameRate, $Payload.FrameGeneration, $Payload.Tlod, $Payload.Olod, $Payload.CloudsQuality, $Payload.TrafficQty))
     [void]$lines.Add(('- Limiter: {0} ({1}%) mix {2}' -f $Payload.LimitDevName, $Payload.LimitPercent, $Payload.LimitWhen))
     [void]$lines.Add(('- GPU avg {0}% peak {1}% VRAM {2} MB; sys CPU {3}%; disk q {4}/{5} {6} MB/s; net {7}/{8} MB/s' -f $Payload.GpuAvg, $Payload.GpuMax, $Payload.VramMaxMB, $Payload.SysCpuAvg, $Payload.DiskQAvg, $Payload.DiskQMax, $Payload.DiskMBpsMax, $Payload.NetAvgMBps, $Payload.NetMaxMBps))
@@ -2367,6 +2691,12 @@ function Complete-FlightSession {
         $session['FpsAvgMs'] = [double]$fps.AvgMs
         $session['FpsSource'] = [string]$fps.Source
         $session['SimSpeed'] = [double]$fps.SimSpeed
+        $session['GameplayFpsCount'] = [int]$fps.GameplayCount
+        $session['GameplayFpsAvg'] = [double]$fps.GameplayAvg
+        $session['GameplayFpsMin'] = [double]$fps.GameplayMin
+        $session['GameplayFpsMax'] = [double]$fps.GameplayMax
+        $session['GameplayFpsAvgMs'] = [double]$fps.GameplayAvgMs
+        $session['GameplayKnown'] = [bool]$fps.GameplayKnown
     }
     $script:LastFps = $null
     $script:LastLimit = 'None'
@@ -2396,8 +2726,19 @@ function Complete-FlightSession {
             }
         }
         $scoreInfo = Get-SessionScore $session $avg $ideas
-        $grade = Get-LetterGrade $scoreInfo.Score
-        $md = Build-SessionMarkdown $session $avg $scoreInfo $ideas $duration
+        $guardGrade = Get-LetterGrade $scoreInfo.Score
+        $gameplayAvg = 0.0
+        $gameplayKnown = $false
+        try { $gameplayKnown = [bool]$session.GameplayKnown } catch { }
+        try { $gameplayAvg = [double]$session.GameplayFpsAvg } catch { }
+        if ($gameplayAvg -le 0 -and -not $gameplayKnown) {
+            try { $gameplayAvg = [double]$session.FpsAvg } catch { }
+        }
+        $cap = 0
+        try { $cap = [int]$session.FrameLimiter } catch { }
+        $perf = Get-GameplayGrade -Avg $gameplayAvg -Cap $cap
+        $grade = [string]$perf.Grade
+        $md = Build-SessionMarkdown $session $avg $scoreInfo $ideas $duration $perf
         $stamp = '{0:yyyyMMdd-HHmmss}' -f $session.EndedAt
         $freeMin = if ($session.FreeRamMin -eq [int]::MaxValue) { $null } else { [int]$session.FreeRamMin }
         $durationText = Format-Duration $duration
@@ -2414,7 +2755,7 @@ function Complete-FlightSession {
             [void]$topPrograms.Add($row)
         }
         $payload = New-Object PSObject
-        Add-Member -InputObject $payload -NotePropertyName SchemaVersion -NotePropertyValue 2
+        Add-Member -InputObject $payload -NotePropertyName SchemaVersion -NotePropertyValue 3
         Add-Member -InputObject $payload -NotePropertyName Id -NotePropertyValue ([string]$session.Id)
         Add-Member -InputObject $payload -NotePropertyName StartedAt -NotePropertyValue $startAt.ToString('o')
         Add-Member -InputObject $payload -NotePropertyName EndedAt -NotePropertyValue $endAt.ToString('o')
@@ -2444,8 +2785,11 @@ function Complete-FlightSession {
         Add-Member -InputObject $payload -NotePropertyName Never -NotePropertyValue ([int]$session.Never)
         Add-Member -InputObject $payload -NotePropertyName Dismissed -NotePropertyValue ([int]$session.Dismissed)
         Add-Member -InputObject $payload -NotePropertyName AutoSleep -NotePropertyValue ([int]$session.AutoSleep)
-        Add-Member -InputObject $payload -NotePropertyName Score -NotePropertyValue ([int]$scoreInfo.Score)
+        Add-Member -InputObject $payload -NotePropertyName Score -NotePropertyValue ([int]$perf.Score)
         Add-Member -InputObject $payload -NotePropertyName Grade -NotePropertyValue $grade
+        Add-Member -InputObject $payload -NotePropertyName GradeLabel -NotePropertyValue ([string]$perf.Label)
+        Add-Member -InputObject $payload -NotePropertyName GuardScore -NotePropertyValue ([int]$scoreInfo.Score)
+        Add-Member -InputObject $payload -NotePropertyName GuardGrade -NotePropertyValue $guardGrade
         $notesCopy = @()
         if ($scoreInfo.Notes) { $notesCopy = [object[]]$scoreInfo.Notes }
         $ideasCopy = @()
@@ -2473,6 +2817,20 @@ function Complete-FlightSession {
         Add-Member -InputObject $payload -NotePropertyName FpsAvgMs -NotePropertyValue ([double]$session.FpsAvgMs)
         Add-Member -InputObject $payload -NotePropertyName FpsCount -NotePropertyValue ([int]$session.FpsCount)
         Add-Member -InputObject $payload -NotePropertyName FpsSource -NotePropertyValue ($(if ($session.FpsSource) { [string]$session.FpsSource } else { 'none' }))
+        $gpAvg = 0.0; $gpMin = 0.0; $gpMax = 0.0; $gpMs = 0.0; $gpN = 0
+        try { $gpAvg = [double]$session.GameplayFpsAvg } catch { }
+        try { $gpMin = [double]$session.GameplayFpsMin } catch { }
+        try { $gpMax = [double]$session.GameplayFpsMax } catch { }
+        try { $gpMs = [double]$session.GameplayFpsAvgMs } catch { }
+        try { $gpN = [int]$session.GameplayFpsCount } catch { }
+        Add-Member -InputObject $payload -NotePropertyName GameplayFpsAvg -NotePropertyValue $gpAvg
+        Add-Member -InputObject $payload -NotePropertyName GameplayFpsMin -NotePropertyValue $gpMin
+        Add-Member -InputObject $payload -NotePropertyName GameplayFpsMax -NotePropertyValue $gpMax
+        Add-Member -InputObject $payload -NotePropertyName GameplayFpsAvgMs -NotePropertyValue $gpMs
+        Add-Member -InputObject $payload -NotePropertyName GameplayFpsCount -NotePropertyValue $gpN
+        $gpKnown = $false
+        try { $gpKnown = [bool]$session.GameplayKnown } catch { }
+        Add-Member -InputObject $payload -NotePropertyName GameplayKnown -NotePropertyValue $gpKnown
         Add-Member -InputObject $payload -NotePropertyName SimSpeed -NotePropertyValue ($(if ($session.SimSpeed) { [double]$session.SimSpeed } else { 1.0 }))
         Add-Member -InputObject $payload -NotePropertyName FrameLimiter -NotePropertyValue ([int]$session.FrameLimiter)
         Add-Member -InputObject $payload -NotePropertyName VSync -NotePropertyValue ([bool]$session.VSync)
@@ -2508,7 +2866,7 @@ function Complete-FlightSession {
         $paths = Write-SessionFiles $payload $stamp $session.MsfsName
         Write-GrokSessionNotes -Payload $payload -Stamp $stamp -Sim $session.MsfsName
         Update-GrokBriefing $payload
-        Write-Log ("Session report {0} grade {1} ({2}) -> {3}" -f $session.Id, $grade, $scoreInfo.Score, $paths.Markdown) 'OK'
+        Write-Log ("Session report {0} grade {1} ({2} FPS) guard {3} ({4}) -> {5}" -f $session.Id, $grade, $gameplayAvg, $guardGrade, $scoreInfo.Score, $paths.Markdown) 'OK'
         if (-not $WriteTestReport) {
             Show-UserReportCard -Payload $payload -DurationText $durationText
             if ([bool]$script:Config.ExitAfterSession) { Finish-AfterSession }
@@ -2519,20 +2877,25 @@ function Complete-FlightSession {
 }
 
 function Open-LastSessionReport {
-    $path = $script:LastReportMd
+    $path = $script:LastReportJson
     if (-not $path -or -not (Test-Path -LiteralPath $path)) {
-        $path = Join-Path $script:LogDir 'latest-session.md'
+        $path = Join-Path $script:LogDir 'latest-session.json'
     }
     if (Test-Path -LiteralPath $path) {
-        Start-Process -FilePath $path
-    } else {
-        [System.Windows.Forms.MessageBox]::Show(
-            'No session report yet. Finish a Flight Simulator session first.',
-            'MSFS Performance Guard',
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
+        $payload = Read-JsonFile $path
+        if ($payload) {
+            $dur = ''
+            try { $dur = [string]$payload.DurationText } catch { }
+            Show-UserReportCard -Payload $payload -DurationText $dur
+            return
+        }
     }
+    [System.Windows.Forms.MessageBox]::Show(
+        'No session report yet. Finish a Flight Simulator session first.',
+        'MSFS Performance Guard',
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    ) | Out-Null
 }
 
 # -----------------------------------------------------------------------------
@@ -2862,15 +3225,17 @@ function Show-CompanionInfo {
         if ($g.CpuPct -lt $bar -and $memMB -lt 1500) { continue }
         [void]$script:CompanionWarned.Add($g.Name)
         $label = Get-FriendlyName $g.Name
-        Write-Log ("Companion {0} is expensive ({1:n1}% CPU, {2} MB) - informing only" -f $g.Name, $g.CpuPct, $memMB) 'INFO'
-        try {
-            $script:Notify.ShowBalloonTip(
-                5000,
-                'Sim add-on is busy',
-                ('{0} is using {1:n0}% CPU / {2:n1} GB. Left running because it is a Flight Simulator add-on.' -f $label, $g.CpuPct, ($memMB / 1024.0)),
-                [System.Windows.Forms.ToolTipIcon]::Info
-            )
-        } catch { }
+        Write-Log ("Companion {0} is expensive ({1:n1}% CPU, {2} MB) - Grok only" -f $g.Name, $g.CpuPct, $memMB) 'INFO'
+        if (Test-ShowSuggestionOverlay) {
+            try {
+                $script:Notify.ShowBalloonTip(
+                    5000,
+                    'Sim add-on is busy',
+                    ('{0} is using {1:n0}% CPU / {2:n1} GB. Left running because it is a Flight Simulator add-on.' -f $label, $g.CpuPct, ($memMB / 1024.0)),
+                    [System.Windows.Forms.ToolTipIcon]::Info
+                )
+            } catch { }
+        }
         return
     }
 }
@@ -3027,7 +3392,11 @@ function Rebuild-Dashboard {
     $pause = if ($script:Paused) { 'Watching is paused.' } else { 'Watching in the background.' }
     $last = ''
     if ($script:LastSessionGrade) {
-        $last = '   |   last session {0} ({1})' -f $script:LastSessionGrade, $script:LastSessionScore
+        if ($script:LastSessionFps -gt 0) {
+            $last = '   |   last session {0}  {1} FPS' -f $script:LastSessionGrade, [int]$script:LastSessionFps
+        } else {
+            $last = '   |   last session {0}' -f $script:LastSessionGrade
+        }
     }
     $hw = ''
     if ($script:MsfsRunning) {
@@ -3409,9 +3778,14 @@ function Invoke-MonitorTick {
 
         $ramBit = if ($free -gt 0) { '  |  {0:n1} GB RAM free' -f ($free / 1024.0) } else { '' }
         $header = $script:MsfsLabel + $ramBit
-        Show-Toast $ranked $header
-        Add-SessionSuggestionShown $ranked
-        Write-Log ('Overlay: {0} ({1})' -f $ranked[0].Label, $ranked[0].Reason) 'INFO'
+        if (Test-ShowSuggestionOverlay) {
+            Show-Toast $ranked $header
+            Add-SessionSuggestionShown $ranked
+            Write-Log ('Overlay: {0} ({1})' -f $ranked[0].Label, $ranked[0].Reason) 'INFO'
+        } else {
+            Add-SessionSuggestionShown $ranked -Shown $false
+            Write-Log ('Saved for Grok (not shown): {0} ({1})' -f $ranked[0].Label, $ranked[0].Reason) 'INFO'
+        }
     } catch {
         Write-Log ("Monitor tick failed: {0} :: {1}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) 'ERR'
         if ($script:Session) { $script:Session.TickErrors++ }
@@ -3481,6 +3855,7 @@ $script:LastReportMd = $null
 $script:LastReportJson = $null
 $script:LastSessionGrade = $null
 $script:LastSessionScore = 0
+$script:LastSessionFps = 0
 $script:HwReady = $false
 $script:PresentMonExe = $null
 $script:PresentMonPid = $null
@@ -3513,7 +3888,17 @@ if (Test-Path -LiteralPath $latestJson) {
     if ($prev -and $prev.Grade) {
         $script:LastSessionGrade = [string]$prev.Grade
         $script:LastSessionScore = [int]$prev.Score
+        try { $script:LastSessionFps = [double]$prev.GameplayFpsAvg } catch { }
+        if ($script:LastSessionFps -le 0) {
+            try { $script:LastSessionFps = [double]$prev.FpsAvg } catch { }
+        }
     }
+}
+
+if ($ShowLastReport) {
+    try { $script:IconOk = Get-GuardIcon 'ok' } catch { }
+    Open-LastSessionReport
+    exit
 }
 
 $state = Import-State
@@ -3587,6 +3972,12 @@ if ($WriteTestReport) {
     $script:Session.FpsMin = 18.2
     $script:Session.FpsMax = 48.0
     $script:Session.FpsAvgMs = 31.8
+    $script:Session.GameplayFpsCount = 720
+    $script:Session.GameplayFpsAvg = 31.4
+    $script:Session.GameplayFpsMin = 22.1
+    $script:Session.GameplayFpsMax = 42.0
+    $script:Session.GameplayFpsAvgMs = 31.8
+    $script:Session.GameplayKnown = $true
     $script:LastFreeRam = 4100
     Update-SessionPeak -Name 'chrome' -CpuPct 6.2 -MemMB 2100 -DiskMBps 1.2
     $script:Session.Peaks['chrome'].Samples = 80
@@ -3727,7 +4118,7 @@ if (-not $script:Hosted) {
             param($sender, $e)
             if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
                 if ($script:ToastVisible) { Hide-Toast; Show-Dashboard }
-                elseif ($script:LastOffenders.Count -gt 0 -and $script:MsfsRunning) {
+                elseif ((Test-ShowSuggestionOverlay) -and $script:LastOffenders.Count -gt 0 -and $script:MsfsRunning) {
                     $ramBit = if ($script:LastFreeRam -gt 0) { '  |  {0:n1} GB RAM free' -f ($script:LastFreeRam / 1024.0) } else { '' }
                     Show-Toast $script:LastOffenders ($script:MsfsLabel + $ramBit)
                 } else {

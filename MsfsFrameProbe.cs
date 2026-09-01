@@ -8,6 +8,7 @@ using System.Threading;
 internal static class Program
 {
     private const uint RecvQuit = 3;
+    private const uint RecvEvent = 4;
     private const uint RecvEventFrame = 7;
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -69,14 +70,18 @@ internal static class Program
         }
 
         SimConnect_SubscribeToSystemEvent(hSim, 1, "Frame");
+        SimConnect_SubscribeToSystemEvent(hSim, 2, "Sim");
+        SimConnect_SubscribeToSystemEvent(hSim, 3, "Pause");
         if (!string.IsNullOrEmpty(csvPath))
         {
-            try { File.WriteAllText(csvPath, "At,Fps,SimSpeed\r\n"); }
+            try { File.WriteAllText(csvPath, "At,Fps,SimSpeed,Sim,Paused\r\n"); }
             catch { }
         }
 
         double sum = 0, min = 9999, max = 0, lastFps = 0, lastSpeed = 1;
-        int n = 0;
+        double playSum = 0, playMin = 9999, playMax = 0;
+        int n = 0, playN = 0;
+        int simRunning = 0, paused = 0;
         DateTime lastWrite = DateTime.MinValue;
         DateTime lastCsv = DateTime.MinValue;
         bool quit = false;
@@ -97,6 +102,14 @@ internal static class Program
                     quit = true;
                     break;
                 }
+                if (id == RecvEvent && cb >= 24)
+                {
+                    uint ev = (uint)Marshal.ReadInt32(pData, 16);
+                    uint data = (uint)Marshal.ReadInt32(pData, 20);
+                    if (ev == 2) simRunning = data != 0 ? 1 : 0;
+                    else if (ev == 3) paused = data != 0 ? 1 : 0;
+                    continue;
+                }
                 if (id == RecvEventFrame && cb >= 32)
                 {
                     float fps = ReadFloat(pData, 24);
@@ -109,6 +122,14 @@ internal static class Program
                         n++;
                         if (fps < min) min = fps;
                         if (fps > max) max = fps;
+                        bool inFlight = simRunning == 1 && paused == 0;
+                        if (inFlight)
+                        {
+                            playSum += fps;
+                            playN++;
+                            if (fps < playMin) playMin = fps;
+                            if (fps > playMax) playMax = fps;
+                        }
                         DateTime now = DateTime.UtcNow;
                         if (!string.IsNullOrEmpty(csvPath) && (now - lastCsv).TotalMilliseconds >= 250)
                         {
@@ -118,7 +139,9 @@ internal static class Program
                                 File.AppendAllText(csvPath,
                                     DateTime.Now.ToString("HH:mm:ss.fff") + "," +
                                     fps.ToString("0.0", inv) + "," +
-                                    spd.ToString("0.00", inv) + "\r\n");
+                                    spd.ToString("0.00", inv) + "," +
+                                    simRunning.ToString(inv) + "," +
+                                    paused.ToString(inv) + "\r\n");
                             }
                             catch { }
                         }
@@ -128,11 +151,18 @@ internal static class Program
             if (n > 0 && (DateTime.UtcNow - lastWrite).TotalMilliseconds >= 400)
             {
                 lastWrite = DateTime.UtcNow;
-                WriteJson(jsonPath, lastFps, lastSpeed, n, sum / n, min, max, inv);
+                WriteJson(jsonPath, lastFps, lastSpeed, n, sum / n, min, max,
+                    playN, playN > 0 ? playSum / playN : 0, playN > 0 ? playMin : 0, playN > 0 ? playMax : 0,
+                    simRunning, paused, inv);
             }
         }
 
-        if (n > 0) WriteJson(jsonPath, lastFps, lastSpeed, n, sum / n, min, max, inv);
+        if (n > 0)
+        {
+            WriteJson(jsonPath, lastFps, lastSpeed, n, sum / n, min, max,
+                playN, playN > 0 ? playSum / playN : 0, playN > 0 ? playMin : 0, playN > 0 ? playMax : 0,
+                simRunning, paused, inv);
+        }
         try { SimConnect_Close(hSim); } catch { }
         try { CloseHandle(hEvent); } catch { }
         return 0;
@@ -152,7 +182,8 @@ internal static class Program
         catch { return true; }
     }
 
-    private static void WriteJson(string path, double fps, double speed, int n, double avg, double min, double max, CultureInfo inv)
+    private static void WriteJson(string path, double fps, double speed, int n, double avg, double min, double max,
+        int playN, double playAvg, double playMin, double playMax, int simRunning, int paused, CultureInfo inv)
     {
         string json = "{\"source\":\"simconnect\",\"fps\":" + fps.ToString("0.0", inv) +
             ",\"simSpeed\":" + speed.ToString("0.00", inv) +
@@ -160,6 +191,12 @@ internal static class Program
             ",\"avg\":" + avg.ToString("0.0", inv) +
             ",\"min\":" + min.ToString("0.0", inv) +
             ",\"max\":" + max.ToString("0.0", inv) +
+            ",\"gameplayCount\":" + playN +
+            ",\"gameplayAvg\":" + playAvg.ToString("0.0", inv) +
+            ",\"gameplayMin\":" + playMin.ToString("0.0", inv) +
+            ",\"gameplayMax\":" + playMax.ToString("0.0", inv) +
+            ",\"simRunning\":" + simRunning +
+            ",\"paused\":" + paused +
             ",\"at\":\"" + DateTime.Now.ToString("o") + "\"}\r\n";
         try
         {

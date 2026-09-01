@@ -15,6 +15,7 @@
   "DismissMinutes": 15,
   "AutoResumeWhenMsfsExits": true,
   "AutoSleepKnownHogs": false,
+  "ShowSuggestionOverlay": false,
   "MaxSuggestions": 5,
   "ShowWelcome": true,
   "ShowCornerBadge": false,

@@ -11,6 +11,7 @@ This folder is a live tray app. After **every Flight Simulator session** it writ
 5. `MSFSGuard.ps1` + `Config.json`
 
 The on-screen flight report card never includes this file.
+Do not show Sleep/Close overlays, next-time tips, or other suggestions to the user. Record them in this briefing and in `Logs/latest-grok-dev.md` so Grok can turn them into app optimizations.
 
 If those files exist, **use them**. Do not guess about nag rate, missed programs, Sleep failures, tick cost, FPS, or what limited the frame rate.
 
@@ -25,6 +26,7 @@ Do the **Next development tasks** in the briefing, highest priority first. Typic
 - speed up the monitor tick if session reports show slow samples
 - keep FPS / limiter wording aligned with the sim Dev FPS overlay (Limited by MainThread vs Limited by GPU)
 - prefer SimConnect Frame (MsfsFrameProbe.exe) for official sim FPS; PresentMon is backup only
+- the on-screen card grades in-flight FPS only (Sim running, not paused). GuardScore in JSON is how well the tray app did; do not show that as the user grade
 - read UserCfg.opt for FrameLimiter / VSync / TLOD / clouds / traffic so advice matches this PC
 - do not scrape MSFS process memory (AutoFPS-style offsets break on every sim update)
 - if GPU is the limiter, do not tell the user that Sleeping Chrome will raise FPS
@@ -32,6 +34,7 @@ Do the **Next development tasks** in the briefing, highest priority first. Typic
 ## Rules
 
 - Sleep / Close stay opt-in unless `AutoSleepKnownHogs` is already true
+- Keep `ShowSuggestionOverlay` false unless the user asks for live overlays again. Suggestions belong in the Grok briefing, not the report card.
 - Never suggest companions, Defender, or protected OS processes
 - After edits: parse `MSFSGuard.ps1` for syntax errors, then restart the tray app (`Stop-Guard.bat` then `Start-Guard.bat`)
 - Do not churn defaults after a grade-A clean session

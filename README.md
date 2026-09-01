@@ -1,13 +1,8 @@
 # MSFS Performance Guard
 
-A tray app that watches the PC **only while Microsoft Flight Simulator is running**. If Chrome, OneDrive, Discord, Edge, Steam’s web helper, or another heavy program is stealing CPU, RAM, or disk, a small overlay appears so you can:
+A tray app that watches the PC **only while Microsoft Flight Simulator is running**. After each flight it shows a short card: grade, gameplay FPS, RAM, and GPU.
 
-- **Sleep** — freeze the program (reversible; it wakes when MSFS exits, or when you resume it)
-- **Close** — quit it (asks first; unsaved work can be lost)
-- **Ignore** — leave it alone for this flight
-- **Never** — never suggest that program again
-
-It does **not** kill or freeze anything on its own unless you turn on `AutoSleepKnownHogs` in `Config.json`. Windows protected processes, Defender, GPU/USB helpers (iCUE, NVIDIA), and sim add-ons (FSUIPC, Little Navmap, vPilot, BeyondATC, SimToolkitPro, …) are never suggested.
+It does **not** pop Sleep/Close suggestions during the flight. Loud programs and limiter notes are written to `Logs/GROK-DEV-BRIEFING.md` so Grok can recommend app optimizations. Nothing is closed or frozen on its own unless you turn on `AutoSleepKnownHogs` in `Config.json`.
 
 Looks and installs the same way as **BootOptimizer**: dark overlay, scheduled task at sign-in, JSON config.
 
@@ -69,7 +64,7 @@ MSFS 2020 (`FlightSimulator`) and MSFS 2024 (`FlightSimulator2024`) are both det
 - Pause watching
 - Exit — always resumes anything still frozen
 
-Left-click the icon to reopen the last suggestion or the dashboard.
+Left-click the icon to open the dashboard.
 
 When MSFS closes, slept programs are woken automatically and a **session report** is written.
 
@@ -79,14 +74,14 @@ When Flight Simulator exits (or you quit the guard mid-flight), the app grades i
 
 | File | What it is |
 | --- | --- |
-| `Logs/latest-session.md` | How the last flight went, plus optimize-next notes |
+| `Logs/latest-session.md` | Short recap (grade, FPS, RAM, GPU) |
 | `Logs/latest-session.json` | Same facts for tools |
 | `Logs/Sessions\*.md` / `*.json` | One pair per flight |
 | `Logs/GROK-DEV-BRIEFING.md` | Rolling "what Grok should change next" from recent flights |
 
-The tray balloon shows the grade (A-F). Right-click the icon → **Open last session report**, or double-click `Open-Last-Session.bat`.
+The on-screen card shows a **realistic letter grade** for how the flight felt, plus **average FPS during gameplay** (menus and pause are left out). Right-click the icon → **Open last session report**, or double-click `Open-Last-Session.bat`.
 
-The report includes:
+The developer JSON still includes:
 
 - FPS from the sim itself (SimConnect **Frame** event — the official in-sim frame rate), with PresentMon as backup
 - your current sim settings from `UserCfg.opt` (Max Frame Rate, VSync, Dynamic Settings, TLOD/OLOD, clouds, traffic) so advice matches what the sim is actually set to
@@ -94,9 +89,8 @@ The report includes:
 - CPU, GPU, VRAM, RAM, disk queue, and network rates so the card can say what actually held frames down
 - MSFS CPU / RAM and how much free RAM you had
 - which overlays appeared, and whether you Slept, Closed, Ignored, or dismissed them
-- programs that were loud but never suggested (missed hogs)
-- concrete next-time advice (graphics vs other programs vs streaming/disk)
-- a **If updating with Grok** task list so the next code change is based on this PC, not guesses
+- programs that were loud (recorded for Grok, not shown on the card)
+- a Grok task list in `Logs/GROK-DEV-BRIEFING.md` so the next code change is based on this PC, not guesses
 
 Tell Grok: *read `GROK.md` and `Logs/GROK-DEV-BRIEFING.md`, then apply the next development tasks.*
 
