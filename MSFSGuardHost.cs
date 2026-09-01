@@ -90,11 +90,13 @@ internal sealed class HostContext : ApplicationContext
     private readonly NotifyIcon tray;
     private readonly Form panel;
     private Label status;
+    private Label title;
     private readonly System.Windows.Forms.Timer watch;
     private readonly System.Windows.Forms.Timer hideSplash;
     private Icon icon;
     private EventWaitHandle sessionDone;
     private DateTime lastEngineStart = DateTime.MinValue;
+    private bool sawSim;
     private readonly bool silent;
 
     public HostContext(string dir, bool silent)
@@ -126,17 +128,42 @@ internal sealed class HostContext : ApplicationContext
                 File.WriteAllText(Path.Combine(dir, @"Logs\host-heartbeat.txt"), DateTime.Now.ToString("o"));
             }
             catch { }
+            bool sessionOver = false;
             try
             {
                 if (sessionDone != null && sessionDone.WaitOne(0))
                 {
-                    HostLog.Write(dir, "Session done - closing after report");
-                    Shutdown(false);
-                    return;
+                    sessionOver = true;
                 }
             }
             catch { }
-            EnsureEngine();
+            try
+            {
+                if (File.Exists(Path.Combine(dir, @"Logs\session-complete.flag")))
+                {
+                    sessionOver = true;
+                }
+            }
+            catch { }
+            if (sessionOver)
+            {
+                HostLog.Write(dir, "Session done - closing after report");
+                Shutdown(false);
+                return;
+            }
+            bool sim = MsfsRunning();
+            bool engine = EngineRunning();
+            if (sim)
+            {
+                sawSim = true;
+                EnsureEngine();
+            }
+            else if (sawSim && !engine)
+            {
+                HostLog.Write(dir, "Sim and monitor both gone - closing ON badge");
+                Shutdown(false);
+                return;
+            }
             RefreshStatus();
         };
         watch.Start();
@@ -196,7 +223,7 @@ internal sealed class HostContext : ApplicationContext
         stripe.Width = 8;
         f.Controls.Add(stripe);
 
-        Label title = new Label();
+        title = new Label();
         title.Text = "MSFS Guard is ON";
         title.Font = new Font("Segoe UI Semibold", 12f);
         title.ForeColor = Color.FromArgb(244, 244, 248);
@@ -332,21 +359,29 @@ internal sealed class HostContext : ApplicationContext
             }
         }
         catch { }
-        if (!engine)
+        if (sim)
         {
-            status.Text = "Monitor starting...";
-        }
-        else if (sim)
-        {
+            title.Text = "MSFS Guard is ON";
             status.Text = admin
                 ? "Flight Simulator is running."
                 : "Sim running. Sleep may need Install.bat (admin).";
         }
+        else if (engine && sawSim)
+        {
+            title.Text = "MSFS Guard";
+            status.Text = "Sim closed. Filing flight log...";
+        }
+        else if (engine)
+        {
+            title.Text = "MSFS Guard";
+            status.Text = admin
+                ? "Waiting for Flight Simulator."
+                : "Waiting for MSFS. Run Install.bat for admin Sleep.";
+        }
         else
         {
-            status.Text = admin
-                ? "Watching. Waiting for MSFS."
-                : "Waiting for MSFS. Run Install.bat for admin Sleep.";
+            title.Text = "MSFS Guard";
+            status.Text = "Monitor starting...";
         }
         tray.Text = "MSFS Guard";
         panel.Text = "MSFS Guard";

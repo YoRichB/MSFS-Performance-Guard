@@ -2179,13 +2179,13 @@ function Add-AirlineStatBox {
     $gold.Dock = [System.Windows.Forms.DockStyle]::Top
     $gold.Height = 2
     $p.Controls.Add($gold)
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = $Title.ToUpper()
-    $title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
-    $title.ForeColor = $Theme.Gold
-    $title.Location = New-Object System.Drawing.Point 12, 10
-    $title.Size = New-Object System.Drawing.Size ($W - 24), 14
-    $p.Controls.Add($title)
+    $hdr = New-Object System.Windows.Forms.Label
+    $hdr.Text = $Title.ToUpper()
+    $hdr.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 7.5)
+    $hdr.ForeColor = $Theme.Gold
+    $hdr.Location = New-Object System.Drawing.Point 12, 10
+    $hdr.Size = New-Object System.Drawing.Size ($W - 24), 14
+    $p.Controls.Add($hdr)
     $val = New-Object System.Windows.Forms.Label
     $val.Text = $Value
     $val.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 16)
@@ -2868,11 +2868,18 @@ function Complete-FlightSession {
         Update-GrokBriefing $payload
         Write-Log ("Session report {0} grade {1} ({2} FPS) guard {3} ({4}) -> {5}" -f $session.Id, $grade, $gameplayAvg, $guardGrade, $scoreInfo.Score, $paths.Markdown) 'OK'
         if (-not $WriteTestReport) {
-            Show-UserReportCard -Payload $payload -DurationText $durationText
+            try {
+                Show-UserReportCard -Payload $payload -DurationText $durationText
+            } catch {
+                Write-Log ("Flight log UI failed: {0} :: {1}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) 'ERR'
+            }
             if ([bool]$script:Config.ExitAfterSession) { Finish-AfterSession }
         }
     } catch {
         Write-Log ("Failed to write session report: {0} :: {1}" -f $_.Exception.Message, $_.InvocationInfo.PositionMessage) 'ERR'
+        if (-not $WriteTestReport -and [bool]$script:Config.ExitAfterSession -and -not $script:Exiting) {
+            Finish-AfterSession
+        }
     }
 }
 
